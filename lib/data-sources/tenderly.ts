@@ -68,6 +68,7 @@ export async function simulateTransaction(
               block_number: blockNumber,
               save: false,
               save_if_fails: false,
+              simulation_type: "full",
             },
             {
               headers: {
@@ -129,6 +130,9 @@ export function extractAssetChanges(
   return result.transaction_info.asset_changes;
 }
 
+// Native ETH pseudo-address for net flow tracking (HR-9)
+const ETH_ADDRESS = "0x0000000000000000000000000000000000000000";
+
 /**
  * Compute net token flows for a wallet from simulation asset changes.
  *
@@ -138,6 +142,9 @@ export function extractAssetChanges(
  *
  * This replaces the previous "first positive transfer" approach,
  * which missed multi-hop swaps and partial fills.
+ *
+ * Includes native ETH transfers (HR-9) — entries without token_info
+ * are tracked under the zero address with 18 decimals.
  */
 export function computeNetTokenFlows(
   changes: Array<{
@@ -157,12 +164,28 @@ export function computeNetTokenFlows(
   const netByToken = new Map<string, { symbol: string; decimals: number; net: bigint }>();
 
   for (const change of changes) {
-    if (change.type !== "ERC20" || !change.token_info?.address) continue;
+    let tokenAddr: string;
+    let symbol: string;
+    let decimals: number;
 
-    const tokenAddr = change.token_info.address.toLowerCase();
+    if (change.type === "ERC20" && change.token_info?.address) {
+      // ERC-20 token transfer
+      tokenAddr = change.token_info.address.toLowerCase();
+      symbol = change.token_info.symbol || "???";
+      decimals = change.token_info.decimals || 18;
+    } else if (!change.token_info?.address) {
+      // Native ETH transfer — no token_info means native value movement (HR-9)
+      tokenAddr = ETH_ADDRESS;
+      symbol = "ETH";
+      decimals = 18;
+    } else {
+      // ERC-721, ERC-1155, etc. — skip non-fungible types
+      continue;
+    }
+
     const entry = netByToken.get(tokenAddr) || {
-      symbol: change.token_info.symbol || "???",
-      decimals: change.token_info.decimals || 18,
+      symbol,
+      decimals,
       net: BigInt(0),
     };
 
@@ -207,7 +230,7 @@ export function getTokenOutputFromChanges(
     amount: string;
   }>,
   userAddress: string
-): { amount: string; tokenAddress: string; symbol?: string } | null {
+): { amount: string; tokenAddress: string; decimals: number; symbol?: string } | null {
   const flows = computeNetTokenFlows(changes, userAddress);
 
   // Find the token with the largest positive net flow (what the user received)
@@ -221,6 +244,7 @@ export function getTokenOutputFromChanges(
   return {
     amount: best.net.toString(),
     tokenAddress: best.tokenAddress,
+    decimals: best.decimals, // HR-8: propagate actual decimals
     symbol: best.symbol,
   };
 }

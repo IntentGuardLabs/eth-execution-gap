@@ -23,7 +23,7 @@ export interface MempoolData {
   inclusion_delay_ms: number;
   included_at_block_height: number;
   mempool_block_number: number;
-  mempool_block_time: number;
+  mempool_block_time: string;
 }
 
 export interface SimulationResult {
@@ -51,6 +51,7 @@ export interface TransactionAnalysisResult {
   actualOutputRaw: string;
   tokenAddress: string;
   tokenSymbol?: string;
+  tokenDecimals?: number; // HR-8: actual decimals from Tenderly token_info
   gapRaw: string;
   gapUsd: number;
   gapType: "sandwich" | "delay" | "slippage";
@@ -64,7 +65,7 @@ export interface TransactionAnalysisResult {
 
 export interface WalletAnalysisResult {
   address: string;
-  /** Analysis window in days (e.g. 180) */
+  /** Analysis window in days (e.g. 30) */
   windowDays: number;
   totalLossUsd: number;
   sandwichLossUsd: number;

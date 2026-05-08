@@ -104,6 +104,7 @@ model TransactionAnalysis {
   actualOutputRaw     String   // BigInt as string
   tokenAddress        String
   tokenSymbol         String?
+  tokenDecimals       Int?     // HR-8: actual decimals from Tenderly token_info
   gapRaw              String   // BigInt as string
   gapUsd              Float
   gapType             String   // "sandwich" | "delay" | "slippage"

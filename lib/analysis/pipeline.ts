@@ -7,7 +7,7 @@ import { calculateGaps } from "@/lib/analysis/calculator";
 import { updateAnalysisJobStatus, createOrUpdateWalletAnalysis, storeTransactionAnalysis, getWalletRank, storeEtherscanTransactions, storeDuneMempoolData, storeTenderlySimulation } from "@/lib/db";
 import { normalizeAddress } from "@/lib/utils";
 import { ANALYSIS_WINDOW_DAYS, BLOCK_TIME_SECONDS } from "@/lib/constants";
-import type { TransactionAnalysisResult, WalletAnalysisResult } from "@/lib/types";
+import type { MempoolData, TransactionAnalysisResult, WalletAnalysisResult } from "@/lib/types";
 
 /**
  * Execute the full MEV analysis pipeline for a wallet
@@ -76,8 +76,15 @@ export async function analyzeWallet(
     });
 
     const txHashes = swapTxs.map((tx) => tx.hash);
-    const mempoolDataMap = await queryMempoolData(txHashes);
-    console.log(`[pipeline:${jobId}] Got mempool data for ${mempoolDataMap.size} txs`);
+    let mempoolDataMap: Map<string, MempoolData>;
+    try {
+      mempoolDataMap = await queryMempoolData(txHashes);
+      console.log(`[pipeline:${jobId}] Got mempool data for ${mempoolDataMap.size} txs`);
+    } catch (duneError) {
+      const errMsg = duneError instanceof Error ? duneError.message : String(duneError);
+      console.warn(`[pipeline:${jobId}] Dune query failed: ${errMsg} — falling back to block N-1 for all txs`);
+      mempoolDataMap = new Map();
+    }
 
     // Step 4: Simulate transactions and get actual outputs
     console.log(`[pipeline:${jobId}] Step 4/6: Simulating ${swapTxs.length} transactions`);
@@ -202,6 +209,7 @@ export async function analyzeWallet(
           actualOutputRaw: actualAmt.toString(),
           tokenAddress: tokenInfo.tokenAddress,
           tokenSymbol: tokenInfo.symbol,
+          tokenDecimals: tokenInfo.decimals, // HR-8: propagate actual decimals
           gapRaw: gapRaw.toString(),
           gapUsd: 0, // Will be calculated in next step
           gapType: "slippage",

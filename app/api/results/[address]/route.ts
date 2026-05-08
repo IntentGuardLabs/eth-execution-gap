@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getWalletAnalysis, getWalletRank } from "@/lib/db";
 import { isValidEthereumAddress, normalizeAddress } from "@/lib/utils";
+import { ANALYSIS_WINDOW_DAYS } from "@/lib/constants";
 
 export async function GET(
   request: NextRequest,
@@ -39,7 +40,7 @@ export async function GET(
     console.log(`[results] Serving results for ${normalizedAddress}: ${analysis.txsAnalyzed} txs, $${analysis.totalLossUsd.toFixed(2)} loss, worst=$${worstTx?.gapUsd?.toFixed(2) ?? "N/A"}`);
 
     // Compute annualized figures on the fly — no DB change needed
-    const windowDays = 180; // matches ANALYSIS_WINDOW_DAYS
+    const windowDays = ANALYSIS_WINDOW_DAYS;
     const annualizedLossUsd = analysis.totalLossUsd * (365 / windowDays);
 
     return NextResponse.json({

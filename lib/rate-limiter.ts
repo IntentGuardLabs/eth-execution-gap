@@ -95,12 +95,12 @@ export const rateLimiters = {
     maxConcurrent: 2,
   }),
   etherscan: new RateLimiter({
-    requestsPerSecond: 5, // Etherscan free tier: 5 calls/sec
+    requestsPerSecond: 3, // Etherscan free tier: 3 calls/sec (5/sec is paid Lite tier)
     maxConcurrent: 1,
   }),
   tenderly: new RateLimiter({
-    requestsPerSecond: 50, // Tenderly free tier: generous rate limits, conservative estimate
-    maxConcurrent: 5,
+    requestsPerSecond: 6, // Tenderly authenticated: 400/min (~6.7/sec), use 6 for safety margin
+    maxConcurrent: 3,
   }),
 };
 

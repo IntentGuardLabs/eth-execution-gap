@@ -4,7 +4,7 @@
 
 ## Project Summary
 
-A Next.js server-rendered application that calculates how much value an Ethereum wallet lost due to the gap between transaction simulation (at mempool arrival time) and actual execution (at block inclusion time). Captures aggregate impact of MEV, price drift, and protocol state changes across a configurable analysis window (default: `ANALYSIS_WINDOW_DAYS` in `constants.ts`, currently 180 days).
+A Next.js server-rendered application that calculates how much value an Ethereum wallet lost due to the gap between transaction simulation (at mempool arrival time) and actual execution (at block inclusion time). Captures aggregate impact of MEV, price drift, and protocol state changes across a configurable analysis window (default: `ANALYSIS_WINDOW_DAYS` in `constants.ts`).
 
 **Product context**: Top-of-funnel growth lever for IntentGuard (MEV protection). Users paste a wallet, see their losses, get nudged to enable protection.
 
@@ -14,7 +14,7 @@ A Next.js server-rendered application that calculates how much value an Ethereum
 
 1. Read `AGENTS.md` — Next.js 16 has breaking changes from what you know.
 2. Read `ARCHITECTURE.md` in the project root — repo structure, blueprint governance, how pieces connect.
-3. Read `blueprints/README.md` for the blueprint index (when it exists).
+3. Read `blueprints/README.md` for the blueprint index.
 4. Read the blueprints relevant to your task:
    - **Pipeline module work** → `02-data-contracts.md` → `03-api-contracts/{service}.md` → `04-edge-cases.md` → `05-database-schema.md`
    - **UI work** → `06-ui-states.md` → `02-data-contracts.md`
@@ -91,7 +91,7 @@ Wallet Address
 [2] Filter: BLACKLIST approach — exclude known no-gap txs, simulate everything else
   |
   v
-[3] Dune: batch SQL on flashbots.mempool_dumpster → timestamp → block mapping
+[3] Dune: batch SQL on flashbots.dataset_mempool_dumpster → timestamp → block mapping
   |     fallback: inclusion_block - 1 if not in mempool dumpster (flagged isEstimated)
   |
   v
@@ -129,6 +129,7 @@ All pipeline stages run server-side. Errors are non-fatal — one tx failing doe
 
 - Every external API call MUST check the database cache first.
 - Use the `withCache(table, key, ttl, fetchFn)` pattern (to be formalized as a shared utility).
+- TTL values are defined in `blueprints/05-database-schema.md`. Do not invent your own.
 - Simulations and historical prices are immutable — cache with no expiry.
 - Transaction lists are short-lived — re-fetch picks up new activity.
 
@@ -192,14 +193,34 @@ Also: `tsconfig.json` targets ES2017 — BigInt literals (`0n`) are not allowed.
 
 Use `coins.llama.fi/prices/current/ethereum:{addr1},ethereum:{addr2},...` with batch requests chunked at 80 tokens. DeFiLlama is free, no API key, CORS-enabled. For ETH use `coingecko:ethereum` as the identifier. If DeFiLlama has no price for a token, mark it as "unpriced" — do not fall back to another provider.
 
+### HR-8: Use actual token decimals from Tenderly, never hardcode 18
+
+`gapToUsd()` in `calculator.ts` MUST use the actual token decimals from Tenderly's `token_info.decimals`, not a hardcoded `18`. The decimals flow through:
+
+```
+computeNetTokenFlows() → getTokenOutputFromChanges() → pipeline result.tokenDecimals → calculateGaps() → gapToUsd()
+```
+
+Without this, 6-decimal tokens (USDC, USDT) have their gaps divided by `10^18` instead of `10^6` — making losses appear ~10^12x smaller than reality. WBTC (8 decimals) is similarly affected. Fall back to `18` only when `tokenDecimals` is missing.
+
+### HR-9: Net flow extraction must include native ETH
+
+`computeNetTokenFlows()` in `tenderly.ts` MUST process native ETH transfers in addition to ERC-20 transfers. Tenderly's `asset_changes` includes native value movements as entries without `token_info`. These MUST be tracked using:
+
+- Address: `0x0000000000000000000000000000000000000000` (zero address)
+- Symbol: `"ETH"`
+- Decimals: `18`
+
+Without this, any swap that outputs native ETH (e.g. USDC → ETH on Uniswap) produces no positive net flow, `getTokenOutputFromChanges()` returns `null`, and the transaction is silently dropped — hiding losses on the most common swap path.
+
 ---
 
 ## External API Discipline
 
 | Service | Rate Limit | Auth | Key Rule |
 |---------|-----------|------|----------|
-| Etherscan | 5 calls/sec | API key in `.env` | Paginate at 10k results |
-| Tenderly | 50 calls/sec (120k sims/month) | API key in `.env` | `save: false`, hex values, 8M gas |
+| Etherscan | 3 calls/sec (free tier) | API key in `.env` | Paginate at 10k results |
+| Tenderly | 400/min ~6.7/sec (120k sims/month) | API key in `.env` | `save: false`, hex values, 8M gas, `simulation_type: "full"` |
 | DeFiLlama | No hard limit | None | Batch tokens per request, chunk at 80 |
 | Dune | 2,500 credits/mo | API key in `.env` | Most constrained — fallback to block N-1 |
 
@@ -223,7 +244,7 @@ const blocksPerDay = Math.floor((24 * 60 * 60) / BLOCK_TIME_SECONDS);  // 7200
 const startBlock = latestBlock - (blocksPerDay * ANALYSIS_WINDOW_DAYS);
 ```
 
-`ANALYSIS_WINDOW_DAYS` (180) and `BLOCK_TIME_SECONDS` (12, post-merge) are in `constants.ts`.
+`ANALYSIS_WINDOW_DAYS` and `BLOCK_TIME_SECONDS` (12, post-merge) are in `constants.ts`.
 
 ---
 
@@ -263,6 +284,65 @@ const startBlock = latestBlock - (blocksPerDay * ANALYSIS_WINDOW_DAYS);
 
 ---
 
+## Blueprint-Driven Development
+
+This project uses blueprints as the single source of truth for all design decisions. Every agent — dev, testing, security, review — operates under this model.
+
+### The Contract
+
+1. **Blueprints describe what to build. Code implements it.** If they disagree, the blueprint is right until explicitly updated.
+2. **Blueprints are updated BEFORE code.** Never implement a change to a data contract, API integration, or edge case handling without updating the relevant blueprint first. A code change without a blueprint update is tech debt by definition.
+3. **Deviations are escalated, not buried.** If a blueprint is wrong or incomplete, say so explicitly in your output. Propose a correction. Do not silently work around it.
+4. **Edge cases are documented before handled.** If you encounter a failure mode not in `blueprints/04-edge-cases.md`, add it with a proposed resolution before writing the handling code.
+5. **Data contracts are the arbiter.** When two modules disagree on a type, field name, or format, `blueprints/02-data-contracts.md` is the tiebreaker.
+
+### Blueprint Index
+
+| Blueprint | What it governs | Updated by |
+|-----------|----------------|------------|
+| `01-pipeline-orchestration.md` | Execution order, concurrency, retries, progress events | Dev agent |
+| `02-data-contracts.md` | Every module's input/output schema with exact types | Dev agent |
+| `03-api-contracts/{service}.md` | Raw API request/response shapes per external service | Dev agent |
+| `04-edge-cases.md` | Every failure mode, detection, resolution, user visibility | Any agent (escalation) |
+| `05-database-schema.md` | Cache tables, TTLs, keys, query patterns | Dev agent |
+| `06-ui-states.md` | What the user sees at each stage | Dev agent |
+
+---
+
+## Knowledge Graph (Graphify)
+
+This project uses Graphify to maintain a knowledge graph of the codebase. A PreToolUse hook in `.claude/settings.json` ensures Claude Code consults the graph before searching files.
+
+### Rules
+
+- The graph in `graphify-out/` is **read-only** during development sessions. Do not run graphify commands.
+- The graph is rebuilt on main after merges: `graphify . --update`
+- `graphify-out/` is in `.gitignore` — it's a derived artifact.
+- Use the graph for **navigation and understanding**. Use blueprints for **specification**.
+
+### Graph vs Blueprints
+
+- **Graph** = "what the code actually does and how it connects" (descriptive)
+- **Blueprints** = "what the code should do" (prescriptive)
+- When they diverge, investigate — it's either a bug or a stale blueprint.
+
+---
+
+## Agent Roles
+
+This project uses specialist agents with defined personas in `.claude/agents/`. Each agent has a specific role, scope, and output directory.
+
+| Agent | File | Writes to | Modifies source? |
+|-------|------|----------|-----------------|
+| Dev | `.claude/agents/dev.md` | `lib/`, `app/`, `blueprints/` | **Yes** |
+| Testing | `.claude/agents/testing.md` | `tests/`, `reports/testing/` | No |
+| Security | `.claude/agents/security.md` | `reports/security/` | No |
+| Review | `.claude/agents/review.md` | `reports/review/` | No |
+
+**Cardinal rule**: Only the dev agent modifies source code. Specialists diagnose, dev agent treats. If you are a specialist agent, do not fix what you find — report it.
+
+---
+
 ## What Not To Do
 
 - Do not move the pipeline to run in the browser. It runs server-side.
@@ -280,6 +360,15 @@ const startBlock = latestBlock - (blocksPerDay * ANALYSIS_WINDOW_DAYS);
 
 These are planned improvements. Do not implement them unless explicitly tasked:
 
-1. **`withCache` utility** — generic cache-check-then-fetch wrapper to replace ad-hoc cache logic in each module.
+1. **`withCache` utility** �� generic cache-check-then-fetch wrapper to replace ad-hoc cache logic in each module.
 2. **Structured pipeline run logs** — JSON log per run with stages, durations, cache hits, errors. Stored in Prisma.
-3. **Blueprint directory** — `blueprints/` populated from actual codebase state (not aspirational specs).
+3. **Blueprint directory** — `blueprints/` populated from actual codebase state.
+
+## graphify
+
+This project has a graphify knowledge graph at graphify-out/.
+
+Rules:
+- Before answering architecture or codebase questions, read graphify-out/GRAPH_REPORT.md for god nodes and community structure
+- If graphify-out/wiki/index.md exists, navigate it instead of reading raw files
+- After modifying code files in this session, run `python3 -c "from graphify.watch import _rebuild_code; from pathlib import Path; _rebuild_code(Path('.'))"` to keep the graph current

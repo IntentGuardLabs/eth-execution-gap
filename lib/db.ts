@@ -185,6 +185,7 @@ export async function storeTransactionAnalysis(
     actualOutputRaw: string;
     tokenAddress: string;
     tokenSymbol?: string;
+    tokenDecimals?: number;
     gapRaw: string;
     gapUsd: number;
     gapType: string;

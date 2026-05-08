@@ -32,7 +32,7 @@ interface ResultsPageProps {
 
 const STEPS: Record<string, string> = {
   pending: "Preparing analysis...",
-  fetching_txs: "Fetching transactions (last 180 days)",
+  fetching_txs: "Fetching transactions (last 30 days)",
   filtering: "Filtering out no-gap transactions",
   querying_mempool: "Querying mempool data",
   simulating: "Simulating transactions",
@@ -63,13 +63,33 @@ export default function ResultsPage({ params }: ResultsPageProps) {
     return () => clearInterval(timer);
   }, [isLoading, startTime]);
 
+  // Direct fetch when navigating without jobId (e.g. leaderboard click)
+  useEffect(() => {
+    if (!address || jobId) return;
+    const fetchResults = async () => {
+      try {
+        const r = await fetch(`/api/results/${address}`);
+        if (!r.ok) {
+          setError("No analysis found for this address");
+          setIsLoading(false);
+          return;
+        }
+        setResults(await r.json());
+        setIsLoading(false);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "An error occurred");
+        setIsLoading(false);
+      }
+    };
+    fetchResults();
+  }, [address, jobId]);
+
+  // Poll job status when jobId is present (new analysis in progress)
   useEffect(() => {
     if (!address || !jobId) return;
-    let pollCount = 0;
 
     const pollStatus = async () => {
       try {
-        pollCount++;
         const response = await fetch(`/api/status/${jobId}`);
         if (!response.ok) throw new Error("Failed to fetch status");
         const status: AnalysisJobStatus = await response.json();
@@ -114,7 +134,7 @@ export default function ResultsPage({ params }: ResultsPageProps) {
   if (isLoading) {
     const allSteps = [
       { key: "pending", label: "Preparing analysis" },
-      { key: "fetching_txs", label: "Fetching transactions (180d)" },
+      { key: "fetching_txs", label: "Fetching transactions (30d)" },
       { key: "filtering", label: "Filtering out no-gap txs" },
       { key: "querying_mempool", label: "Querying mempool data" },
       { key: "simulating", label: "Simulating transactions" },
@@ -298,12 +318,12 @@ export default function ResultsPage({ params }: ResultsPageProps) {
         {/* Summary Cards */}
         <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.08 }} className="grid grid-cols-4 gap-3 mb-8">
           <div className="rounded-2xl border border-accent-red/20 bg-accent-red/[0.04] p-6">
-            <p className="text-[10px] font-semibold uppercase tracking-widest text-muted mb-2">Total ({results.windowDays || 180}d)</p>
+            <p className="text-[10px] font-semibold uppercase tracking-widest text-muted mb-2">Total ({results.windowDays || 30}d)</p>
             <p className="text-3xl font-extrabold gradient-text tabular-nums">{formatUSD(results.totalLossUsd)}</p>
           </div>
           <div className="rounded-2xl border border-accent-red/20 bg-accent-red/[0.04] p-6">
             <p className="text-[10px] font-semibold uppercase tracking-widest text-muted mb-2">Annualized</p>
-            <p className="text-3xl font-extrabold gradient-text tabular-nums">{formatUSD(results.annualizedLossUsd || results.totalLossUsd * (365 / (results.windowDays || 180)))}</p>
+            <p className="text-3xl font-extrabold gradient-text tabular-nums">{formatUSD(results.annualizedLossUsd || results.totalLossUsd * (365 / (results.windowDays || 30)))}</p>
             <p className="text-[11px] text-muted mt-1">projected /year</p>
           </div>
           <div className="rounded-2xl border border-white/[0.06] bg-card p-6">

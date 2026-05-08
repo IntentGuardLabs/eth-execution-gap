@@ -93,8 +93,12 @@ export async function queryMempoolData(txHashes: string[]): Promise<Map<string, 
       const state = resultsResponse.data.state;
       console.log(`[dune] Poll #${attempts}: state=${state}`);
 
-      if (resultsResponse.data.is_execution_finished || state === "QUERY_STATE_COMPLETED") {
+      if (state === "QUERY_STATE_COMPLETED" || state === "QUERY_STATE_COMPLETED_PARTIAL") {
         isComplete = true;
+
+        if (state === "QUERY_STATE_COMPLETED_PARTIAL") {
+          console.warn(`[dune] Query returned partial results — some rows may be missing`);
+        }
 
         // Process results - group by tx hash and take the most recent block
         const groupedByHash = new Map<string, any[]>();
@@ -123,9 +127,9 @@ export async function queryMempoolData(txHashes: string[]): Promise<Map<string, 
         }
 
         console.log(`[dune] Query complete, got mempool data for ${results.size} txs`);
-      } else if (state === "QUERY_STATE_FAILED") {
+      } else if (state === "QUERY_STATE_FAILED" || state === "QUERY_STATE_CANCELED" || state === "QUERY_STATE_EXPIRED") {
         throw new Error(
-          `Dune query failed: ${resultsResponse.data.error || "unknown error"}`
+          `Dune query ${state}: ${resultsResponse.data.error || "unknown error"}`
         );
       }
     }

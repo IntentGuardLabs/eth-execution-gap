@@ -54,7 +54,7 @@ export const UNISWAP_V2_SWAP_TOPIC = "0xd78ad95fa46c994b6551d0da85fc275fe1cb487d
 export const UNISWAP_V3_SWAP_TOPIC = "0xc42079f94a6350d7e6235f29174924f7e02632f38141c3461f98fd0d690df807";
 
 // Analysis window (days)
-export const ANALYSIS_WINDOW_DAYS = 180;
+export const ANALYSIS_WINDOW_DAYS = 30;
 
 // Execution delay threshold (ms) - more than 1 block
 export const EXECUTION_DELAY_THRESHOLD_MS = 12000;
@@ -68,7 +68,7 @@ export const BLOCK_TIME_MS = 12000;
 // API Rate Limits
 export const API_RATE_LIMITS = {
   DEFILLAMA_REQ_PER_SEC: 5, // Free, no key needed — conservative
-  ETHERSCAN_REQ_PER_SEC: 5,
+  ETHERSCAN_REQ_PER_SEC: 3, // Free tier: 3/sec (5/sec is paid Lite tier)
   DUNE_QUERY_TIMEOUT_MS: 30000,
   TENDERLY_SIMULATION_TIMEOUT_MS: 30000,
 } as const;
@@ -83,7 +83,7 @@ export const PAGINATION = {
 // Analysis status messages
 export const STATUS_MESSAGES = {
   pending: "Queued for analysis",
-  fetching_txs: "Fetching transaction history (last 180 days)",
+  fetching_txs: "Fetching transaction history",
   filtering: "Filtering out no-gap transactions",
   querying_mempool: "Querying mempool data",
   simulating: "Simulating transactions",

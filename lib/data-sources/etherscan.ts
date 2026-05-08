@@ -60,7 +60,7 @@ export async function fetchWalletTransactions(
   }
 
   // Etherscan enforces page * offset <= 10000, so we use pageSize=1000, max 10 pages.
-  // Limit to ANALYSIS_WINDOW_DAYS (180 days) to keep analysis fast and API-friendly.
+  // Limit to ANALYSIS_WINDOW_DAYS to keep analysis fast and API-friendly.
   const transactions: Transaction[] = [];
   let page = 1;
   const pageSize = 1000;

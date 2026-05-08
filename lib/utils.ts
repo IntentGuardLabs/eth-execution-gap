@@ -103,8 +103,10 @@ export function parseBigInt(value: string): bigint {
  * Convert BigInt to decimal string with decimals
  */
 export function bigIntToDecimal(value: bigint, decimals: number): number {
-  const divisor = BigInt(10 ** decimals);
-  return Number(value) / Number(divisor);
+  const divisor = BigInt(10 ** Math.min(decimals, 18));
+  const whole = value / divisor;
+  const frac = value % divisor;
+  return Number(whole) + Number(frac) / Number(divisor);
 }
 
 /**

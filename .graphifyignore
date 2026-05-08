@@ -1,0 +1,15 @@
+CLAUDE.md
+ARCHITECTURE.md
+README.md
+.claude/
+blueprints/
+reports/
+docs/
+*.md
+*.svg
+*.png
+*.jpg
+*.jpeg
+*.ico
+*.gif
+public/

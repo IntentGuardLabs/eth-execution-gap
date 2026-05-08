@@ -136,7 +136,7 @@ export async function calculateGaps(
       const gapUsd = gapToUsd(
         result.gapRaw,
         price,
-        18 // Default ERC20 decimals
+        result.tokenDecimals || 18 // HR-8: use actual decimals, fallback 18
       );
 
       const gapType = categorizeGapType(
