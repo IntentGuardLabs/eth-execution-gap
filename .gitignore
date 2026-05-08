@@ -32,6 +32,7 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+!.env.example
 
 # vercel
 .vercel
@@ -39,3 +40,27 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# private — internal docs and intermediate artifacts kept locally only
+/blueprints/
+/specs/
+/reports/
+/.claude/
+CLAUDE.md
+AGENTS.md
+graphify-out/
+.graphifyignore
+
+# CLI output — local cache and run reports
+/.cache/
+/data/
+/tests/
+
+# legacy web-app artifacts (preserved on the web-app branch only)
+/app/
+/prisma/
+/public/
+Dockerfile
+docker-compose.yml
+next.config.ts
+postcss.config.mjs

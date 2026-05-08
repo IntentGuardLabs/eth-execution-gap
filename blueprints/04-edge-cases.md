@@ -1,12 +1,13 @@
 # Blueprint 04: Edge Cases
 
-> Version: 1.0 | Last updated: 2026-04-11
+> Version: 1.1 | Last updated: 2026-04-14
 
 Every known failure mode, how we detect it, what we do about it, and what the user sees. If you encounter a failure mode not listed here, **add it before writing handling code**.
 
 ## Changelog
 
 - 2026-04-11: Initial version — documented from codebase + Hardened Rules
+- 2026-04-14 (v1.1): Added Stage P (Protocol Swap Pipeline) covering P1–P5 failure modes for the Uniswap V2 batch entrypoint.
 
 ---
 
@@ -150,6 +151,16 @@ Every known failure mode, how we detect it, what we do about it, and what the us
 | **Resolution** | Same as EC-3.3 — throw, fall back to heuristic |
 | **User sees** | Pipeline continues |
 | **Logging** | Error logged by catch block |
+
+### EC-3.7: Dune completely unavailable
+
+| | |
+|---|---|
+| **Trigger** | Any Dune failure: credits exhausted, API down, key invalid, timeout, query error |
+| **Detection** | `queryMempoolData()` throws — caught by pipeline try/catch at `pipeline.ts:80-87` |
+| **Resolution** | Pipeline logs warning, continues with empty `Map<string, MempoolData>`. All txs fall back to `estimateMempoolBlockNumber(inclusionBlock)` = block N-1. All results flagged `isEstimated: true`. |
+| **User sees** | Analysis completes normally. Results may be slightly less accurate (all mempool blocks estimated). |
+| **Logging** | `[pipeline:{jobId}] Dune query failed: {msg} — falling back to block N-1 for all txs` |
 
 ### EC-3.6: Dune LEFT JOIN returns null mempool_block_number
 
@@ -343,7 +354,7 @@ Every known failure mode, how we detect it, what we do about it, and what the us
 | **Trigger** | Whale/bot wallet with massive DeFi activity |
 | **Detection** | Etherscan pagination limit (EC-1.2) caps at 10,000 raw txs |
 | **Resolution** | Analyze up to 10,000 most recent txs. Results are partial. |
-| **Accepted inaccuracy** | Yes — stated as "last 30 days" but may not capture all activity for extreme wallets |
+| **Accepted inaccuracy** | Yes — stated as "last 10 days" but may not capture all activity for extreme wallets |
 
 ---
 
@@ -395,41 +406,17 @@ Every known failure mode, how we detect it, what we do about it, and what the us
 
 ---
 
-## Stage 7b: Storage Idempotency
+## Stage 7b: Storage Idempotency — RESOLVED (Task 10)
 
-### EC-7b.1: Re-analysis duplicates raw Etherscan data
-
-| | |
-|---|---|
-| **Trigger** | Same wallet analyzed twice |
-| **Detection** | None — `storeEtherscanTransactions` uses `create`, not `upsert` |
-| **Resolution** | Duplicate `EtherscanTxRaw` rows created (no unique constraint on txHash in this table) |
-| **User sees** | No visible impact, but DB grows with duplicates |
-| **Impact** | Low — data correctness unaffected, storage waste only |
-
-### EC-7b.2: Re-analysis duplicates raw Dune data
-
-| | |
-|---|---|
-| **Trigger** | Same wallet analyzed twice |
-| **Detection** | None — `storeDuneMempoolData` uses `create`, not `upsert` |
-| **Resolution** | Duplicate `DuneMempoolRaw` rows created |
-| **User sees** | No visible impact |
-| **Impact** | Low — same as EC-7b.1 |
+Both `storeEtherscanTransactions` and `storeDuneMempoolData` now use `upsert` with `@@unique([walletAnalysisId, txHash])` composite keys. Re-analysis is idempotent — no duplicate rows.
 
 ---
 
 ## Dead Code / Unused Features
 
-### EC-DC.1: Sandwich detection not wired into pipeline
+### EC-DC.1: Sandwich detection — REMOVED
 
-| | |
-|---|---|
-| **Trigger** | N/A — `detectSandwiches()` is imported but never called in `pipeline.ts` |
-| **Detection** | Code inspection |
-| **Resolution** | All transactions remain `isSandwiched: false` and `gapType: "slippage"` or `"delay"` |
-| **User sees** | Sandwich column always shows 0; sandwich loss always $0 |
-| **Impact** | **Medium** — feature exists in code but is non-functional |
+`sandwich.ts` and `detectSandwiches()` removed. Sandwich detection is deferred to a future phase. All transactions have `isSandwiched: false`. The `isSandwiched` and `sandwichBotAddress` fields remain in the schema for forward compatibility.
 
 ### EC-DC.2: `retryWithBackoff` not used in pipeline orchestrator
 
@@ -460,3 +447,262 @@ Every known failure mode, how we detect it, what we do about it, and what the us
 | **Resolution** | All throttling works via `waitForSlot()` busy-polling |
 | **User sees** | No impact |
 | **Impact** | None — dead code with no behavioral consequence |
+
+---
+
+## Stage P: Protocol Swap Pipeline
+
+Failure modes for the protocol-level batch entrypoint (blueprint 02 §"Protocol Swap Pipeline", v1: Uniswap V2). Module references P1–P5 correspond to the module labels in blueprint 02.
+
+### EC-P1.1: Dune returns bytes columns with ambiguous encoding
+
+| | |
+|---|---|
+| **Trigger** | `ethereum.transactions.to` / `.hash` / `.data` columns are VARBINARY; DuneSQL result JSON encodes them inconsistently across result versions (sometimes `"0x..."`, sometimes raw hex without prefix) |
+| **Detection** | Post-query mapping step in `queryProtocolTxsWithMempool()` |
+| **Resolution** | `normalizeBytesField()` in `lib/data-sources/dune.ts` — accepts either form and returns a lowercase `"0x..."` string |
+| **User sees** | Nothing — handled transparently |
+| **Logging** | None (silent normalization) |
+
+### EC-P1.2: Dune returns numeric columns in scientific notation
+
+| | |
+|---|---|
+| **Trigger** | Large `tx.value` or `tx.gas_price` values get serialized by DuneSQL as JSON numbers or scientific-notation strings |
+| **Detection** | Mapping step, `toDecimalString()` |
+| **Resolution** | `toDecimalString()` attempts `BigInt(s)`, falls back to integer part before the decimal separator, falls back to `"0"` on parse failure |
+| **User sees** | Nothing — handled transparently |
+| **Logging** | None |
+
+### EC-P1.3: Dune protocol query timeout
+
+| | |
+|---|---|
+| **Trigger** | Query polling hits 600s cap without `QUERY_STATE_COMPLETED` |
+| **Detection** | Poll loop exits with `firstPage == null` |
+| **Resolution** | Throw `Error("Dune protocol query timeout after 600 seconds")` — surfaces as `status: "error"` on the `ProtocolAnalysisRun` row via the `runProtocolAnalysis()` catch block |
+| **User sees** | Run row marked `error` with the timeout message |
+| **Logging** | `[protocol:{runId}] FAILED: Dune protocol query timeout after 600 seconds` |
+| **Note** | Raised from 240s → 600s on 2026-04-15 after observing `QUERY_STATE_EXECUTING` at the 240s mark on a partition-pruned 1-day query. Partition pruning (EC-P1.8) dropped the typical runtime to < 60s but the first run per TTL window can still hit 3–5 minutes while Dune warms partition metadata |
+
+### EC-P1.4: Dune mempool-block lookup via blocks table is error-prone
+
+| | |
+|---|---|
+| **Trigger** | Earlier approach joined `ethereum.blocks` with a 13-second window to resolve `mempool_block_number` from `timestamp_ms`. The 13s window against 12s blocks matched 1–2 blocks per tx, duplicating rows on joins, and also forced an extra table scan per query |
+| **Detection** | Prevented by query shape |
+| **Resolution** | `queryProtocolTxsWithMempool()` no longer touches `ethereum.blocks`. Instead it derives `mempool_block_number` in pure arithmetic: `tx.block_number - CAST(ceil(inclusion_delay_ms / 12000.0) AS integer)`. Post-merge Ethereum uses fixed 12s slots, so the derivation is accurate to ±1 block. For the gap-analysis use case (simulating at the "block active when the tx arrived in the mempool") a ±1 block error is within simulation noise. Zero duplicate-row risk because no additional join exists |
+| **User sees** | Nothing — handled transparently |
+| **Logging** | None |
+| **Status** | **RESOLVED** (2026-04-14) |
+
+### EC-P1.5: Failed transactions included in the protocol tx list
+
+| | |
+|---|---|
+| **Trigger** | `ethereum.transactions` includes reverted txs — we don't want to waste Tenderly sims on them |
+| **Detection** | The `success` boolean column on `ethereum.transactions` is filtered in the Dune WHERE clause |
+| **Resolution** | `queryProtocolTxsWithMempool()` adds `AND tx.success = true` to the WHERE clause. Reverted router calls never leave Dune, so they never reach the decoder or simulator |
+| **User sees** | Nothing — reverts are silently excluded from `txsDiscovered` |
+| **Logging** | None |
+| **Status** | **RESOLVED** (2026-04-14) |
+
+### EC-P1.6: Dune results endpoint paginates large result sets
+
+| | |
+|---|---|
+| **Trigger** | The `/execution/{id}/results` endpoint returns at most one page of rows per request. Result sets larger than the default page size are served via `next_uri` / `next_offset` pagination |
+| **Detection** | Response body contains a `next_uri` field when more rows are available |
+| **Resolution** | `queryProtocolTxsWithMempool()` follows `next_uri` in a loop until it is absent, concatenating each page's `result.rows` into a single array before returning. Uses `is_execution_finished` (docs-specified) to detect terminal state rather than matching state strings |
+| **User sees** | Nothing — transparent to caller |
+| **Logging** | `[dune] Protocol pagination: {n} rows so far` every ~1000 rows |
+| **Note** | At `PROTOCOL_ANALYSIS_TX_LIMIT = 200` pagination never triggers. It kicks in around `limit: 1000+` depending on Dune's current default page size |
+
+### EC-P1.7: Dune error body is an object, not a string
+
+| | |
+|---|---|
+| **Trigger** | When `state` is `QUERY_STATE_FAILED` / `CANCELED` / `EXPIRED`, the `error` field on the response is a structured object with a `message` field (per Dune docs), not a plain string |
+| **Detection** | Polling loop in `queryProtocolTxsWithMempool()` inspects `data.error` on terminal failure |
+| **Resolution** | Extract `error.message` when the field is an object, fall back to `JSON.stringify(error)`, then to `"unknown error"`. Never passes `[object Object]` into the thrown message |
+| **User sees** | Meaningful error message on the `ProtocolAnalysisRun.error` column |
+| **Logging** | Error surfaces via `[protocol:{runId}] FAILED: ...` |
+
+### EC-P1.8: `ethereum.transactions` full-scan without partition filter
+
+| | |
+|---|---|
+| **Trigger** | Earlier query only filtered on `tx.block_time >= CURRENT_TIMESTAMP - INTERVAL '1' DAY`. `block_time` is not the partition key on `ethereum.transactions`, so DuneSQL scanned the entire table before applying the filter, blowing through the 240s poll cap while still in `QUERY_STATE_EXECUTING` |
+| **Detection** | Observed on 2026-04-15 — poll #120 at state `QUERY_STATE_EXECUTING finished=false`, thrown as timeout by EC-P1.3 |
+| **Resolution** | Added `AND tx.block_date >= CURRENT_DATE - INTERVAL '{days}' DAY` to the WHERE clause. `block_date` is the partition key (per `ethereum.transactions` docs), so this restricts the scan to 1–2 daily partitions. The `block_time` filter is kept as the precise boundary — prune first via `block_date`, then filter the partition contents via `block_time`. Typical runtime dropped from > 10 min to < 60s |
+| **User sees** | Query completes within poll window |
+| **Logging** | `[dune] Protocol query complete, N rows total` (usually visible within the first few poll cycles) |
+| **Note** | Also justifies the 600s poll cap (EC-P1.3 update) — first run per TTL can still take 3–5 minutes while Dune warms partition metadata |
+
+### EC-P2.1: Unknown selector (non-swap call to Router02)
+
+| | |
+|---|---|
+| **Trigger** | Tx is sent to Router02 but calldata selector is not one of the 9 supported swap methods (e.g. `addLiquidity`, `removeLiquidity`, `quote`) |
+| **Detection** | `decodeUniV2Swap()` returns `null` on selector miss |
+| **Resolution** | Tx is dropped silently from the decoded set. Counts toward `txsDiscovered` but not `txsDecoded`, so the rate is observable via the run row |
+| **User sees** | Nothing — tx is absent from the run's `ProtocolSwapAnalysis` rows |
+| **Logging** | None (expected path — most Router02 traffic is swaps but not all) |
+
+### EC-P2.2: Malformed calldata
+
+| | |
+|---|---|
+| **Trigger** | Truncated or corrupted calldata: bad `path_offset`, path length 0 or > 10, slot of wrong size |
+| **Detection** | `decodeUniV2Swap()` — returns `null` on length mismatch, out-of-range path length, or BigInt parse failure |
+| **Resolution** | Tx dropped from the decoded set; counted like EC-P2.1 |
+| **User sees** | Nothing |
+| **Logging** | `[univ2-decoder] Failed to decode {txHash}: {error message}` |
+
+### EC-P2.3: `ethIn`/`ethOut` method with `path[0]`/`path[last]` not WETH
+
+| | |
+|---|---|
+| **Trigger** | Caller passed a non-WETH address in the ETH slot of the path — extremely rare, would fail in the router anyway |
+| **Detection** | `decodeUniV2Swap()` path-vs-method sanity check |
+| **Resolution** | **Warn only.** The decoded output still collapses the user-facing side to the zero-address pseudo-token (HR-9). Let the simulation be the ground truth |
+| **User sees** | Nothing — swap is still analyzed |
+| **Logging** | `[univ2-decoder] {txHash}: ethIn method but path[0]={addr} != WETH` (or `ethOut`/`path[last]`) |
+
+### EC-P2.4: `deadline` parameter present in calldata but not decoded
+
+| | |
+|---|---|
+| **Trigger** | All 9 swap methods have a `deadline` param in their ABI |
+| **Detection** | N/A — this is a deliberate design choice, not a failure |
+| **Resolution** | **Not extracted.** `deadline` is a user-chosen upper bound on inclusion time, not a signing timestamp. Signing time is inferred from `flashbots.dataset_mempool_dumpster.timestamp_ms` (per Stage 3 / EC-3.1). Extracting `deadline` would invite future misuse as a signing-time proxy |
+| **User sees** | Nothing |
+| **Logging** | None |
+
+### EC-P3.1: `evaluateSwap()` throws mid-run
+
+| | |
+|---|---|
+| **Trigger** | Unexpected error inside `evaluateSwap()` (network blip, Tenderly auth failure, etc.) |
+| **Detection** | Try/catch in the `runProtocolAnalysis()` main loop |
+| **Resolution** | Emit a `ProtocolSwapResult` with `simulationStatus: "skipped"` and `error: {message}`, persisted alongside successful rows. Run continues |
+| **User sees** | Skipped swap visible as a row with zero gap and an error message |
+| **Logging** | `[protocol:{runId}] evaluateSwap failed for {txHash}: {error message}` |
+
+### EC-P3.2: Both simulations return null
+
+| | |
+|---|---|
+| **Trigger** | Tenderly returns null for both mempool-block and inclusion-block sims (e.g. tx reverts at both blocks, Tenderly outage mid-tx) |
+| **Detection** | `extractOutflow()` / `extractInflow()` both return `null` on each sim |
+| **Resolution** | `simulationStatus: "both_failed"`, `error: "both simulations failed"`, all amount/gap fields zeroed. Row persisted for audit |
+| **User sees** | Swap visible but with zero gap; appears in `txsDiscovered`/`txsDecoded` but NOT in `txsSimulated` |
+| **Logging** | Captured at Tenderly module level |
+
+### EC-P3.3: Tx absent from mempool dumpster (private relay)
+
+| | |
+|---|---|
+| **Trigger** | Tx was submitted via Flashbots / private relay / was too old for Dune's dumpster window |
+| **Detection** | `mempoolTimestampMs` / `mempoolBlockNumber` are null in the Dune row (LEFT JOIN with `flashbots.dataset_mempool_dumpster`) |
+| **Resolution** | Fall back to `mempoolBlockNumber = inclusionBlockNumber - 1`. `isEstimated = true` flag is persisted on the swap row so downstream consumers can filter |
+| **User sees** | Swap is analyzed, marked estimated; results may be slightly less accurate |
+| **Logging** | None (LEFT JOIN is the documented path) |
+| **Note** | Analogous to EC-3.1 for the per-wallet pipeline |
+
+### EC-P3.5: Unclassified token flows bucket-collide with native ETH
+
+| | |
+|---|---|
+| **Trigger** | Superseded by EC-P3.7. The symptom was real (all gaps coming out zero) but the diagnosis was wrong — the root cause was that the entire `asset_changes` interface in the codebase did not match what Tenderly actually returns, not a "honeypot" bucket collision |
+| **Detection** | Observed on 2026-04-15 in smoke run `cmnz7hti50000h7cudy2q083j` |
+| **Resolution** | First attempted fix (tightening the native-ETH branch to `type === "NATIVE"`) made the bug more honest but didn't address the root cause — see EC-P3.7 for the correct fix |
+| **Status** | **SUPERSEDED** by EC-P3.7 (2026-04-15) |
+
+### EC-P3.7: `SimulationResult` interface did not match real Tenderly shape
+
+| | |
+|---|---|
+| **Trigger** | The `SimulationResult` type (and the inline `changes` shapes on `computeNetTokenFlows`, `getTokenOutputFromChanges`, `extractAssetChanges`) were entirely fictional. Tenderly's v1 `simulate` endpoint with `simulation_type: "full"` returns a shape where (a) `token_info.address` does not exist — the real field is `token_info.contract_address`, (b) the top-level `type` is `"Mint"` / `"Transfer"` / `"Burn"` (event-level), NOT a token standard, (c) the token standard lives at `token_info.standard` with values `"ERC20"` / `"NativeCurrency"` / etc., (d) `amount` is a human-readable decimal string (e.g. `"0.1376"`), NOT a BigInt-parseable wei value — the wei string is in `raw_amount` |
+| **Detection** | Smoke run `cmnz82m4d0000zh11udt68sv5` on 2026-04-15 produced `discovered=53 decoded=53 simulated=53 withGap=0 totalGapUsd=0.00` with `[tenderly] Net flows: 0 positive, 0 negative, 0 zero` on every tx. Inspecting `TenderlySimulationRaw.simulationResult` revealed the real shape — `token_info.contract_address`, `token_info.standard`, `raw_amount` — completely different from what `lib/types.ts::SimulationResult` declared |
+| **Resolution** | 2026-04-15 rewrite of `lib/types.ts::SimulationResult` and `lib/data-sources/tenderly.ts::computeNetTokenFlows()` to use the real shape: (1) new `TenderlyAssetChange` type in `lib/types.ts` matching the observed fields; (2) discrimination via `token_info.standard` (`"NativeCurrency"` → zero-address ETH bucket, `"ERC20"` with `contract_address` → ERC-20 bucket, everything else logged and dropped); (3) BigInt amounts parsed from `raw_amount` with defensive fallback to the truncated decimal `amount`; (4) `Mint` events handled correctly (no `from`). `extractAssetChanges` and `getTokenOutputFromChanges` signatures updated to use `TenderlyAssetChange[]` for consistency. HR-9 in `CLAUDE.md` rewritten to describe the real shape explicitly and call out the old-code symptoms |
+| **User sees** | First time raw amounts are non-zero end-to-end. Gaps become meaningful. The wallet pipeline also produces correct net flows for the first time — a dormant regression that existed since the asset-extraction rewrite (HR-4) and was never caught because the per-wallet flow's end-to-end "looked reasonable" to users who never cross-checked raw amounts |
+| **Logging** | Per-change log line now shows `raw=<BigInt>` instead of the decimal `amount`. Drop-fall-through logs `[tenderly]   SKIP: standard=... type=... contract=... symbol=... amount=...` so mis-classified entries can be observed empirically |
+| **Status** | **RESOLVED** (2026-04-15). Needs re-validation run to confirm non-zero gaps on real data |
+| **Note** | This is a **cross-pipeline** fix — the wallet flow and the protocol flow share `computeNetTokenFlows`. Wallet-pipeline USD numbers produced before 2026-04-15 should be considered unreliable. Re-running existing wallet analyses is not mandatory but highly recommended |
+
+### EC-P3.6: Mempool-dumpster hit rate unknown on larger samples
+
+| | |
+|---|---|
+| **Trigger** | 5/5 txs in the 2026-04-15 smoke run (`windowDays=1`, `limit=5`) came back with `mempoolBlockNumber = null` (no matching row in `dune.flashbots.dataset_mempool_dumpster`), forcing the `isEstimated: true` fallback for every tx |
+| **Detection** | `ProtocolSwapAnalysis.isEstimated = true` on every row of the smoke run |
+| **Resolution** | **Open.** A 5-tx random slice is not statistically meaningful — legitimate for a smoke test, but needs a dedicated check at `limit=200 windowDays=1` to measure the actual dumpster hit rate on Uniswap V2 Router02 txs. If the rate is >= 50%, the `isEstimated` fallback is a reasonable edge case. If it's < 50%, `isEstimated` becomes the default and the "mempool-arrival-time proxy" premise of the protocol pipeline is degraded — we'd need to either (a) switch mempool source, (b) limit runs to txs present in the dumpster, or (c) document the accuracy loss prominently in the UI |
+| **User sees** | On the current (buggy?) hit rate: all gaps are computed relative to `inclusion - 1` rather than real mempool-arrival, inflating apparent slippage numbers |
+| **Logging** | None yet — worth adding `estimatedCount / decodedCount` to the run summary line |
+| **Status** | **OPEN** — pending limit=200 measurement run |
+
+### EC-P3.4: Token decimals fall back to 18 when neither sim touched the token
+
+| | |
+|---|---|
+| **Trigger** | Exotic routing where the user's wallet never appears as `from`/`to` on the decoded `tokenIn` or `tokenOut` in either simulation's `asset_changes` |
+| **Detection** | `firstTouched()` returns undefined; the zero-flow placeholder's default `decimals: 18` is used |
+| **Resolution** | Placeholder defaults to 18. **Under the v1.4 gap-computability gate (EC-P4.3) this case now produces `totalGapUsd = 0` because the mempool and/or inclusion sim both emit only placeholder flows for the target tokens. The wrong-decimals outcome is no longer possible to reach a USD field — it can still show up in raw amounts, which are audit-only.** |
+| **User sees** | Swap visible with raw amounts but `totalGapUsd = 0`, excluded from run aggregates |
+| **Logging** | None |
+| **Status** | **RESOLVED (indirectly) by v1.4 gap-computability gate** — on-chain `decimals()` lookup is still a nice-to-have for UI display of raw amounts, but no longer pollutes USD math |
+
+### EC-P4.1: Positive slippage (user received MORE / paid LESS than predicted) — v1.4
+
+| | |
+|---|---|
+| **Trigger** | Favorable slippage: actual execution was better than the mempool-block simulation |
+| **Detection** | `priceProtocolSwaps()` — sign is preserved rather than clamped |
+| **Resolution** | Under v1.4 sign convention, positive slippage appears as a **positive** `totalGapUsd` on the per-swap row (the user gained USD relative to sim). Aggregate `totalGapUsd` on the run is signed: it's the net of all priced gains and losses on computable swaps. UI renders positive values in green as "positive slippage" |
+| **User sees** | Some swaps show positive USD total; top-of-page run summary may show either `+$X net gain` or `−$X net loss` depending on the sample |
+| **Logging** | None |
+| **Note** | Analogous to EC-5.4 in the per-wallet pipeline. **v1.3 stored the opposite sign** — loss was positive — and the v1.4 migration negated all existing `amountInGapUsd / amountOutGapUsd / totalGapUsd / topLossUsd` values. Any tooling that queries those fields directly must assume the v1.4 convention from 2026-04-15 onward. |
+
+### EC-P4.3: Gap math applied to one-sided sim data produced entire-trade-size "gaps" (v1.4 fix)
+
+| | |
+|---|---|
+| **Trigger** | Two overlapping cases: (a) `simulationStatus = "mempool_failed"` or `"inclusion_failed"`, where HR-5 substitutes `BigInt(0)` for the missing side and the pipeline then computes `actual − 0 = full trade notional` instead of a delta; (b) `simulationStatus = "ok"` but the target tokens never appeared in either sim's `asset_changes` (EC-P3.4), so `firstTouched()` returns undefined and both sides fall back to placeholder zeros |
+| **Detection** | Smoke audit 2026-04-15 on `cmnz9kfz*` runs: 119 `mempool_failed` rows contributed ~$1,406 of bogus gap and 3 `ok`-with-placeholder rows contributed smaller noise. Pattern: `expectedAmountInRaw = "0" AND expectedAmountOutRaw = "0" AND (actualAmountInRaw != "0" OR actualAmountOutRaw != "0")`, with a symmetric variant for `inclusion_failed` |
+| **Resolution** | `priceProtocolSwaps()` (v1.4) adds a **gap-computability gate**: a row is only USD-priceable when `simulationStatus == "ok"` AND both sides of both sims have at least one real (non-placeholder, non-zero) flow for a target token. When the gate fails, raw amounts are preserved but `amountInGapUsd / amountOutGapUsd / totalGapUsd` are set to `0`. Run-level `totalGapUsd` aggregation excludes these rows. HR-5 is unchanged — it still applies to the intermediate `amount*GapRaw` computation — but the USD layer no longer trusts the raw fields of non-computable rows |
+| **User sees** | Previously misleading rows disappear from the run total and are flagged (simulation incomplete) in the UI. The legitimate loss/gain signal is no longer drowned out by trade-notional noise |
+| **Logging** | `[pricer] {n}/{m} swaps gap-computable; {n_non} non-computable excluded from USD aggregate` |
+| **Status** | **RESOLVED (v1.4, 2026-04-15)** — one-shot backfill ran on existing rows: zeroed the USD fields on all non-computable rows, negated signs on all remaining rows, recomputed `ProtocolAnalysisRun.totalGapUsd / topLossUsd` from the cleaned per-swap data |
+| **Note** | The underlying sim-failure cases (P3.2 / P3.3 / P3.4) are all upstream causes. The gate is a defensive boundary at the USD layer, not a replacement for fixing any one of those |
+
+### EC-P4.2: DeFiLlama has no price for one or both swap tokens
+
+| | |
+|---|---|
+| **Trigger** | Long-tail / scam / freshly deployed token not indexed by DeFiLlama |
+| **Detection** | `resolvePrices()` returns a Map without that address |
+| **Resolution** | Token is marked "unpriced" (`tokenInPriceUsd`/`tokenOutPriceUsd = null`). That side of the gap is recorded as USD 0, the other side is still priced normally. `totalGapUsd` reflects the priced side only |
+| **User sees** | Swap appears with a partial or zero USD total even though `amount*GapRaw` is non-zero — raw values remain available for audit |
+| **Logging** | `[pricer] {n} of {m} tokens have no DeFiLlama price` |
+
+### EC-P5.1: `inclusionBlockTime` unparseable by JS `Date`
+
+| | |
+|---|---|
+| **Trigger** | DuneSQL returns the timestamp in an unexpected string format across result-version changes |
+| **Detection** | `saveProtocolSwaps()` calls `new Date(s.inclusionBlockTime)` — an invalid input yields `Invalid Date`, which Prisma either rejects or persists as null |
+| **Resolution** | Guard with `Date.parse()` before constructing the `Date`; on parse failure log a warning and substitute `new Date()` (fetch-time) so the row still persists. Dune normalizer in `queryProtocolTxsWithMempool()` should ideally emit an ISO8601 string |
+| **User sees** | Swap row persisted with approximately-correct timestamp if Dune changes its format |
+| **Logging** | `[db] inclusionBlockTime unparseable for {txHash}: {raw value}` |
+
+### EC-P5.2: Large `saveProtocolSwaps()` batch overloads SQLite
+
+| | |
+|---|---|
+| **Trigger** | `Promise.all(swaps.map(upsert))` on a 5000-row batch |
+| **Detection** | Not auto-detected — observable as slow writes or `SQLITE_BUSY` under load |
+| **Resolution** | Wrap in `prisma.$transaction([...upserts])` or chunk to e.g. 200 rows per batch |
+| **User sees** | Longer run completion time |
+| **Logging** | None |
+| **Status** | **OPEN ADVISORY** — addressed when scaling beyond `limit: 1000` |

@@ -23,91 +23,206 @@ export interface MempoolData {
   inclusion_delay_ms: number;
   included_at_block_height: number;
   mempool_block_number: number;
-  mempool_block_time: string;
+  /**
+   * Datetime of the mempool block. Only populated when the SQL query
+   * joins `ethereum.blocks`. The 2026-05 rewrite of `queryMempoolData`
+   * computes `mempool_block_number` via arithmetic on `inclusion_delay_ms`
+   * instead and leaves this field undefined.
+   */
+  mempool_block_time?: string;
+}
+
+/**
+ * Single entry in Tenderly's `transaction_info.asset_changes` array.
+ *
+ * Shape corrected on 2026-04-15 after inspecting real responses from the
+ * `simulation_type: "full"` endpoint. Prior to this, the codebase assumed
+ * a shape that didn't exist (`token_info.address`, `type === "ERC20"`),
+ * which caused every asset change to collapse into the zero-address
+ * "ETH" bucket with amount 0 — see EC-P3.7.
+ */
+export interface TenderlyAssetChange {
+  /** Event-level classification — NOT a token standard. */
+  type: "Mint" | "Transfer" | "Burn" | string;
+  /** Absent on `Mint` events (minted from nothing). Lowercase hex on Transfers. */
+  from?: string;
+  /** Always present. Lowercase hex. */
+  to: string;
+  /** Human-readable decimal amount, e.g. `"0.1376"`. Use `raw_amount` for math. */
+  amount: string;
+  /** BigInt-parseable wei/base-unit string, e.g. `"137600000000000000"` — preferred for arithmetic. */
+  raw_amount?: string;
+  /** USD value at simulation time, if Tenderly knew a price. */
+  dollar_value?: string;
+  /**
+   * Token metadata. Populated for BOTH ERC-20 and native ETH entries
+   * (native ETH has `standard: "NativeCurrency"` and no `contract_address`).
+   */
+  token_info?: {
+    /** `"ERC20"`, `"NativeCurrency"`, `"ERC721"`, `"ERC1155"`, etc. */
+    standard: string;
+    /** `"Fungible"`, `"Native"`, `"NonFungible"`, etc. */
+    type?: string;
+    /** Present for ERC-20 / NFT entries. Absent for native ETH. */
+    contract_address?: string;
+    symbol?: string;
+    name?: string;
+    decimals?: number;
+  };
 }
 
 export interface SimulationResult {
   transaction_info: {
-    asset_changes: Array<{
-      type: string;
-      from: string;
-      to: string;
-      token_info?: {
-        address: string;
-        symbol: string;
-        decimals: number;
-      };
-      amount: string;
-    }>;
+    asset_changes: TenderlyAssetChange[];
   };
+  /**
+   * Tenderly's `transaction.status` field, hoisted up here for caller
+   * convenience. `true` = the simulated EVM execution succeeded.
+   * `false` = it reverted (slippage check, missing approval, pool state
+   * mismatch, etc.). When false, `asset_changes` is typically empty —
+   * the canonical gap analysis must NOT treat that as "expected = 0";
+   * see `analyzeTransactionGap`.
+   */
+  status: boolean;
+  /** Reason from Tenderly when `status` is false. */
+  errorMessage?: string;
 }
 
-export interface TransactionAnalysisResult {
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Protocol Swap Pipeline (blueprint 02, "Protocol Swap Pipeline" section)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Shared candidate-tx shape consumed by any AnalysisPath. */
+export interface CandidateTx {
   txHash: string;
-  blockNumber: number;
-  mempoolBlockNumber?: number;
-  inclusionDelayMs?: number;
-  expectedOutputRaw: string;
-  actualOutputRaw: string;
-  tokenAddress: string;
-  tokenSymbol?: string;
-  tokenDecimals?: number; // HR-8: actual decimals from Tenderly token_info
-  gapRaw: string;
-  gapUsd: number;
-  gapType: "sandwich" | "delay" | "slippage";
-  isSandwiched: boolean;
-  sandwichBotAddress?: string;
-  frontrunTxHash?: string;
-  backrunTxHash?: string;
+  sender: string;
+  to: string;
+  calldata: string;
+  value: string;
+  gasPrice: string;
+  inclusionBlockNumber: number;
+  inclusionBlockTime: string;
+  mempoolTimestampMs: string | null;
+  mempoolBlockNumber: number | null;
+  inclusionDelayMs: number | null;
+}
+
+/** Module P1 output — one row per router tx, joined with mempool_dumpster. */
+export type ProtocolTxRow = CandidateTx;
+
+export type UniV2SwapMethod =
+  | "swapExactTokensForTokens"
+  | "swapTokensForExactTokens"
+  | "swapExactETHForTokens"
+  | "swapTokensForExactETH"
+  | "swapExactTokensForETH"
+  | "swapETHForExactTokens"
+  | "swapExactTokensForTokensSupportingFeeOnTransferTokens"
+  | "swapExactETHForTokensSupportingFeeOnTransferTokens"
+  | "swapExactTokensForETHSupportingFeeOnTransferTokens";
+
+/** Module P2 output — decoded UniV2 swap call. `deadline` is intentionally NOT present. */
+export interface DecodedUniV2Swap {
+  txHash: string;
+  method: UniV2SwapMethod;
+  selector: string;
+  isExactIn: boolean;
+  tokenInIsNative: boolean;
+  tokenOutIsNative: boolean;
+  tokenIn: string;
+  tokenOut: string;
+  path: string[];
+  amountInParam: string;
+  amountOutParam: string;
+  recipient: string;
+}
+
+/** Module P3 output — per-tx analysis result for a protocol swap. */
+export interface ProtocolSwapResult {
+  txHash: string;
+  sender: string;
+  router: string;
+  protocol: "uniswap-v2";
+
+  method: UniV2SwapMethod;
+  selector: string;
+  isExactIn: boolean;
+  tokenInIsNative: boolean;
+  tokenOutIsNative: boolean;
+  tokenIn: string;
+  tokenOut: string;
+  tokenInSymbol?: string;
+  tokenOutSymbol?: string;
+  tokenInDecimals?: number;
+  tokenOutDecimals?: number;
+  pathJson: string;
+  amountInParam: string;
+  amountOutParam: string;
+  recipient: string;
+
+  mempoolBlockNumber: number | null;
+  inclusionBlockNumber: number;
+  mempoolTimestampMs: string | null;
+  inclusionBlockTime: string;
+  inclusionDelayMs: number | null;
   isEstimated: boolean;
-  contractAddress?: string; // For protocol-level aggregation
-}
 
-export interface WalletAnalysisResult {
-  address: string;
-  /** Analysis window in days (e.g. 30) */
-  windowDays: number;
-  totalLossUsd: number;
-  sandwichLossUsd: number;
-  delayLossUsd: number;
-  slippageLossUsd: number;
-  /** Annualized total loss (totalLossUsd * 365 / windowDays) */
-  annualizedLossUsd: number;
-  txsAnalyzed: number;
-  txsSandwiched: number;
-  avgDelayMs?: number;
-  rank?: number;
-  worstTx?: {
-    hash: string;
-    lossUsd: number;
-    type: string;
-  };
-  transactions: TransactionAnalysisResult[];
-  analyzedAt: string;
-}
+  expectedAmountInRaw: string;
+  expectedAmountOutRaw: string;
+  actualAmountInRaw: string;
+  actualAmountOutRaw: string;
 
-export interface AnalysisJobStatus {
-  jobId: string;
-  status: "pending" | "fetching_txs" | "filtering" | "querying_mempool" | "simulating" | "calculating" | "complete" | "error";
-  progress: number;
-  totalTxs?: number;
-  processedTxs?: number;
-  currentStep?: string;
+  amountInGapRaw: string;
+  amountOutGapRaw: string;
+
+  tokenInPriceUsd: number | null;
+  tokenOutPriceUsd: number | null;
+  amountInGapUsd: number;
+  amountOutGapUsd: number;
+  totalGapUsd: number;
+
+  simulationStatus:
+    | "ok"
+    | "mempool_failed"
+    | "inclusion_failed"
+    | "both_failed"
+    | "skipped";
   error?: string;
+
+  rawCalldata: string;
 }
 
-export interface LeaderboardEntry {
-  rank: number;
-  address: string;
-  addressTruncated: string;
-  totalLossUsd: number;
-  txsSandwiched: number;
-}
-
-export interface LeaderboardResponse {
-  entries: LeaderboardEntry[];
-  totalWallets: number;
-  page: number;
+export interface ProtocolAnalysisRunInput {
+  protocol: "uniswap-v2";
+  routerAddress: string;
+  windowDays: number;
+  /**
+   * Precise window in minutes. When set (> 0), takes precedence over
+   * `windowDays` in the Dune query (`INTERVAL 'N' MINUTE`). Also causes the
+   * Dune result cache to be bypassed — sub-day smoke runs are ephemeral and
+   * don't participate in the router-scoped cache.
+   */
+  windowMinutes?: number;
   limit: number;
-  totalPages: number;
+}
+
+export interface ProtocolAnalysisRunResult {
+  runId: string;
+  protocol: "uniswap-v2";
+  routerAddress: string;
+  windowDays: number;
+  windowMinutes?: number;
+  windowStartBlock: number;
+  windowEndBlock: number;
+  txsDiscovered: number;
+  txsDecoded: number;
+  txsSimulated: number;
+  txsWithGap: number;
+  totalGapUsd: number;
+  topLossTxHash?: string;
+  topLossUsd?: number;
+  swaps: ProtocolSwapResult[];
+  startedAt: string;
+  completedAt: string;
 }

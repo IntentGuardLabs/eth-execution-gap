@@ -1,309 +1,94 @@
-import { PrismaClient } from "@prisma/client";
-
-// Avoid instantiating multiple PrismaClient instances in development
-const globalForPrisma = global as unknown as { prisma: PrismaClient };
-
-export const prisma =
-  globalForPrisma.prisma ||
-  new PrismaClient({
-    log:
-      process.env.NODE_ENV === "development"
-        ? ["error"]
-        : ["error"],
-  });
-
-if (process.env.NODE_ENV !== "production") {
-  globalForPrisma.prisma = prisma;
-}
-
 /**
- * Get or create an analysis job
+ * Local file-based cache for the CLI.
+ *
+ * Replaces the Prisma-backed cache used by the web-app branch with plain
+ * JSON files under `.cache/`. Exported function signatures match the
+ * web-app version so callers in `lib/data-sources/*` and `lib/analysis/*`
+ * don't need to change. There are NO result tables here — runs compute
+ * in memory and the CLI prints / writes a report file. Nothing is
+ * persisted beyond the upstream-API caches below.
+ *
+ * Cache layout:
+ *   .cache/tenderly/{txHash}_{blockNumber}.json
+ *   .cache/dune/mempool/{txHash}.json
+ *   .cache/dune/protocol/{router}.json                  (rows)
+ *   .cache/dune/protocol/{router}.fetched-at.json       (TTL marker)
+ *   .cache/prices/{tokenAddress}.json
  */
-export async function getOrCreateAnalysisJob(address: string) {
-  const existing = await prisma.analysisJob.findFirst({
-    where: { address },
-    orderBy: { createdAt: "desc" },
-  });
 
-  if (existing && existing.status !== "error") {
-    return existing;
+import { mkdir, readFile, writeFile, stat } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import type {
+  MempoolData,
+  ProtocolTxRow,
+  SimulationResult,
+} from "@/lib/types";
+
+const CACHE_ROOT = process.env.CLI_CACHE_DIR ?? ".cache";
+
+// ─── primitive helpers ─────────────────────────────────────────────────────
+
+async function readJson<T>(path: string): Promise<T | null> {
+  try {
+    const buf = await readFile(path, "utf8");
+    return JSON.parse(buf) as T;
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code === "ENOENT") return null;
+    throw err;
   }
-
-  return prisma.analysisJob.create({
-    data: {
-      address,
-      status: "pending",
-      progress: 0,
-    },
-  });
 }
 
-/**
- * Update analysis job status
- */
-export async function updateAnalysisJobStatus(
-  jobId: string,
-  status: string,
-  progress: number,
-  data?: {
-    totalTxs?: number;
-    processedTxs?: number;
-    error?: string;
-  }
-) {
-  return prisma.analysisJob.update({
-    where: { id: jobId },
-    data: {
-      status,
-      progress,
-      totalTxs: data?.totalTxs,
-      processedTxs: data?.processedTxs,
-      error: data?.error,
-      updatedAt: new Date(),
-    },
-  });
+async function writeJson(path: string, value: unknown): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, JSON.stringify(value, null, 2), "utf8");
 }
 
-/**
- * Get analysis job by ID
- */
-export async function getAnalysisJob(jobId: string) {
-  return prisma.analysisJob.findUnique({
-    where: { id: jobId },
-  });
-}
-
-/**
- * Get wallet analysis with transactions
- */
-export async function getWalletAnalysis(address: string) {
-  return prisma.walletAnalysis.findUnique({
-    where: { address },
-    include: {
-      transactions: {
-        orderBy: { createdAt: "desc" },
-      },
-    },
-  });
-}
-
-/**
- * Create or update wallet analysis
- */
-export async function createOrUpdateWalletAnalysis(
-  address: string,
-  data: {
-    totalLossUsd: number;
-    sandwichLossUsd: number;
-    delayLossUsd: number;
-    slippageLossUsd: number;
-    txsAnalyzed: number;
-    txsSandwiched: number;
-    worstTxHash?: string;
-    worstTxLossUsd?: number;
-    avgDelayMs?: number;
-  }
-) {
-  return prisma.walletAnalysis.upsert({
-    where: { address },
-    create: {
-      address,
-      ...data,
-    },
-    update: data,
-  });
-}
-
-/**
- * Get leaderboard with pagination
- */
-export async function getLeaderboard(page: number, limit: number) {
-  const skip = (page - 1) * limit;
-
-  const [entries, total] = await Promise.all([
-    prisma.walletAnalysis.findMany({
-      orderBy: { totalLossUsd: "desc" },
-      skip,
-      take: limit,
-      select: {
-        address: true,
-        totalLossUsd: true,
-        txsSandwiched: true,
-      },
-    }),
-    prisma.walletAnalysis.count(),
-  ]);
-
-  return {
-    entries: entries.map((entry, index) => ({
-      rank: skip + index + 1,
-      address: entry.address,
-      totalLossUsd: entry.totalLossUsd,
-      txsSandwiched: entry.txsSandwiched,
-    })),
-    total,
-    page,
-    limit,
-    totalPages: Math.ceil(total / limit),
-  };
-}
-
-/**
- * Get wallet rank
- */
-export async function getWalletRank(address: string): Promise<number | null> {
-  const wallet = await prisma.walletAnalysis.findUnique({
-    where: { address },
-  });
-
-  if (!wallet) {
+async function fileMtimeMs(path: string): Promise<number | null> {
+  try {
+    const st = await stat(path);
+    return st.mtimeMs;
+  } catch {
     return null;
   }
-
-  const rank = await prisma.walletAnalysis.count({
-    where: {
-      totalLossUsd: {
-        gt: wallet.totalLossUsd,
-      },
-    },
-  });
-
-  return rank + 1;
 }
 
-/**
- * Store transaction analysis results
- */
-export async function storeTransactionAnalysis(
-  walletAnalysisId: string,
-  transactions: Array<{
-    txHash: string;
-    blockNumber: number;
-    mempoolBlockNumber?: number;
-    inclusionDelayMs?: number;
-    expectedOutputRaw: string;
-    actualOutputRaw: string;
-    tokenAddress: string;
-    tokenSymbol?: string;
-    tokenDecimals?: number;
-    gapRaw: string;
-    gapUsd: number;
-    gapType: string;
-    isSandwiched: boolean;
-    sandwichBotAddress?: string;
-    frontrunTxHash?: string;
-    backrunTxHash?: string;
-    isEstimated: boolean;
-  }>
-) {
-  return Promise.all(
-    transactions.map((tx) =>
-      prisma.transactionAnalysis.upsert({
-        where: { txHash: tx.txHash },
-        create: {
-          ...tx,
-          walletAnalysisId,
-        },
-        update: tx,
-      })
-    )
+function safe(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]/g, "_");
+}
+
+// ─── Tenderly simulation cache ─────────────────────────────────────────────
+
+function tenderlyPath(
+  txHash: string,
+  blockNumber: number,
+  transactionIndex: number
+): string {
+  return join(
+    CACHE_ROOT,
+    "tenderly",
+    `${safe(txHash)}_${blockNumber}_i${transactionIndex}.json`
   );
 }
 
-/**
- * Check if transaction is already analyzed
- */
-export async function isTransactionAnalyzed(txHash: string): Promise<boolean> {
-  const tx = await prisma.transactionAnalysis.findUnique({
-    where: { txHash },
-  });
-  return !!tx;
+interface TenderlyEntry {
+  txHash: string;
+  blockNumber: number;
+  transactionIndex: number;
+  from: string;
+  to: string;
+  input: string;
+  value: string;
+  gas: string;
+  gasPrice: string;
+  simulationResult: SimulationResult;
+  simulatedAt: string;
 }
 
-/**
- * Store raw Etherscan transactions for a wallet analysis
- */
-export async function storeEtherscanTransactions(
-  walletAnalysisId: string,
-  transactions: Array<{
-    hash: string;
-    from: string;
-    to: string;
-    value: string;
-    input: string;
-    gas: string;
-    gasPrice: string;
-    gasUsed?: string;
-    blockNumber: number;
-    blockHash?: string;
-    transactionIndex: number;
-    isError: string;
-    txreceipt_status?: string;
-    timeStamp: string;
-  }>
-) {
-  console.log(`[db] Storing ${transactions.length} raw Etherscan transactions for wallet analysis ${walletAnalysisId}`);
-  return Promise.all(
-    transactions.map((tx) =>
-      prisma.etherscanTxRaw.create({
-        data: {
-          walletAnalysisId,
-          txHash: tx.hash,
-          from: tx.from,
-          to: tx.to,
-          value: tx.value,
-          input: tx.input,
-          gas: tx.gas,
-          gasPrice: tx.gasPrice,
-          gasUsed: tx.gasUsed,
-          blockNumber: tx.blockNumber,
-          blockHash: tx.blockHash,
-          transactionIndex: tx.transactionIndex,
-          isError: tx.isError,
-          txreceipt_status: tx.txreceipt_status,
-          timeStamp: tx.timeStamp,
-        },
-      })
-    )
-  );
-}
-
-/**
- * Store raw Dune mempool query results
- */
-export async function storeDuneMempoolData(
-  walletAnalysisId: string,
-  mempoolData: Array<{
-    txHash: string;
-    blockNumber: number;
-    mempoolBlockNumber?: number;
-    inclusionDelayMs?: number;
-    queryResult: Record<string, any>;
-  }>
-) {
-  console.log(`[db] Storing ${mempoolData.length} raw Dune mempool results for wallet analysis ${walletAnalysisId}`);
-  return Promise.all(
-    mempoolData.map((data) =>
-      prisma.duneMempoolRaw.create({
-        data: {
-          walletAnalysisId,
-          txHash: data.txHash,
-          blockNumber: data.blockNumber,
-          mempoolBlockNumber: data.mempoolBlockNumber,
-          inclusionDelayMs: data.inclusionDelayMs,
-          queryResult: JSON.stringify(data.queryResult),
-        },
-      })
-    )
-  );
-}
-
-/**
- * Store raw Tenderly simulation results
- */
 export async function storeTenderlySimulation(
   txHash: string,
   blockNumber: number,
+  transactionIndex: number,
   simulationData: {
     from: string;
     to: string;
@@ -313,23 +98,232 @@ export async function storeTenderlySimulation(
     gasPrice: string;
     simulationResult: Record<string, any>;
   }
-) {
-  return prisma.tenderlySimulationRaw.upsert({
-    where: { txHash_blockNumber: { txHash, blockNumber } },
-    create: {
-      txHash,
-      blockNumber,
-      from: simulationData.from,
-      to: simulationData.to,
-      input: simulationData.input,
-      value: simulationData.value,
-      gas: simulationData.gas,
-      gasPrice: simulationData.gasPrice,
-      simulationResult: JSON.stringify(simulationData.simulationResult),
-    },
-    update: {
-      simulationResult: JSON.stringify(simulationData.simulationResult),
-      simulatedAt: new Date(),
-    },
-  });
+): Promise<void> {
+  const entry: TenderlyEntry = {
+    txHash,
+    blockNumber,
+    transactionIndex,
+    from: simulationData.from,
+    to: simulationData.to,
+    input: simulationData.input,
+    value: simulationData.value,
+    gas: simulationData.gas,
+    gasPrice: simulationData.gasPrice,
+    simulationResult: simulationData.simulationResult as SimulationResult,
+    simulatedAt: new Date().toISOString(),
+  };
+  await writeJson(tenderlyPath(txHash, blockNumber, transactionIndex), entry);
+}
+
+export async function getCachedSimulation(
+  txHash: string,
+  blockNumber: number,
+  transactionIndex: number
+): Promise<SimulationResult | null> {
+  const entry = await readJson<TenderlyEntry>(
+    tenderlyPath(txHash, blockNumber, transactionIndex)
+  );
+  if (!entry?.simulationResult) return null;
+  // Defensive: pre-2026-05-08 cache entries don't carry the `status`
+  // field. Without it, the analyzer can't distinguish "sim succeeded
+  // with no flows" from "sim reverted" — and that distinction is what
+  // separates a real gap from trade-notional noise. Treat as cache
+  // miss so the next run rebuilds with the full shape.
+  if (typeof entry.simulationResult.status !== "boolean") {
+    console.log(
+      `[cache] tenderly entry missing status field (legacy shape) — refetching ${txHash}@${blockNumber}#${transactionIndex}`
+    );
+    return null;
+  }
+  return entry.simulationResult;
+}
+
+// ─── Dune mempool cache (per-tx) ───────────────────────────────────────────
+
+function duneMempoolPath(txHash: string): string {
+  return join(CACHE_ROOT, "dune", "mempool", `${safe(txHash)}.json`);
+}
+
+interface DuneMempoolEntry {
+  txHash: string;
+  data: MempoolData;
+  fetchedAt: string;
+}
+
+export async function storeDuneMempoolData(
+  txHash: string,
+  data: MempoolData
+): Promise<void> {
+  const entry: DuneMempoolEntry = {
+    txHash,
+    data,
+    fetchedAt: new Date().toISOString(),
+  };
+  await writeJson(duneMempoolPath(txHash), entry);
+}
+
+export async function getCachedMempoolData(
+  txHashes: string[]
+): Promise<Map<string, MempoolData>> {
+  const out = new Map<string, MempoolData>();
+  for (const h of txHashes) {
+    const entry = await readJson<DuneMempoolEntry>(duneMempoolPath(h));
+    if (entry) out.set(h.toLowerCase(), entry.data);
+  }
+  return out;
+}
+
+// ─── Token price cache (DeFiLlama) ─────────────────────────────────────────
+
+function pricePath(tokenAddress: string): string {
+  return join(CACHE_ROOT, "prices", `${safe(tokenAddress)}.json`);
+}
+
+interface PriceEntry {
+  tokenAddress: string;
+  priceUsd: number;
+  fetchedAt: string;
+}
+
+export async function storePrices(prices: Map<string, number>): Promise<void> {
+  for (const [token, priceUsd] of prices) {
+    const entry: PriceEntry = {
+      tokenAddress: token.toLowerCase(),
+      priceUsd,
+      fetchedAt: new Date().toISOString(),
+    };
+    await writeJson(pricePath(token), entry);
+  }
+}
+
+const PRICE_TTL_MS = 60 * 60 * 1000; // 1h — prices age, but the CLI run is short
+
+export async function getCachedPrices(
+  tokenAddresses: string[]
+): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  const now = Date.now();
+  for (const t of tokenAddresses) {
+    const path = pricePath(t);
+    const mtime = await fileMtimeMs(path);
+    if (mtime == null || now - mtime > PRICE_TTL_MS) continue;
+    const entry = await readJson<PriceEntry>(path);
+    if (entry) out.set(t.toLowerCase(), entry.priceUsd);
+  }
+  return out;
+}
+
+// ─── Dune protocol-tx cache (router-scoped) ────────────────────────────────
+
+function protocolRowsPath(routerAddress: string): string {
+  return join(CACHE_ROOT, "dune", "protocol", `${safe(routerAddress)}.json`);
+}
+function protocolMarkerPath(routerAddress: string): string {
+  return join(
+    CACHE_ROOT,
+    "dune",
+    "protocol",
+    `${safe(routerAddress)}.fetched-at.json`
+  );
+}
+
+interface ProtocolRowsEntry {
+  routerAddress: string;
+  windowDays: number;
+  rows: ProtocolTxRow[];
+  fetchedAt: string;
+}
+
+interface ProtocolMarkerEntry {
+  routerAddress: string;
+  windowDays: number;
+  rowCount: number;
+  fetchedAt: string;
+}
+
+export async function getCachedDuneProtocolTxs(
+  routerAddress: string,
+  windowDays: number,
+  ttlMs: number
+): Promise<ProtocolTxRow[] | null> {
+  const marker = await readJson<ProtocolMarkerEntry>(
+    protocolMarkerPath(routerAddress)
+  );
+  if (!marker) return null;
+  const age = Date.now() - new Date(marker.fetchedAt).getTime();
+  if (age > ttlMs) return null;
+  if (marker.windowDays < windowDays) return null;
+
+  const entry = await readJson<ProtocolRowsEntry>(
+    protocolRowsPath(routerAddress)
+  );
+  if (!entry) return null;
+
+  const cutoff = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000);
+  const rows = entry.rows.filter(
+    (r) => new Date(r.inclusionBlockTime) >= cutoff
+  );
+
+  console.log(
+    `[cache] Dune protocol HIT: router=${routerAddress.slice(0, 10)}... rows=${rows.length} (age=${(age / 1000).toFixed(0)}s)`
+  );
+  return rows;
+}
+
+export async function saveDuneProtocolTxsBatch(
+  routerAddress: string,
+  rows: ProtocolTxRow[]
+): Promise<void> {
+  if (rows.length === 0) return;
+  const path = protocolRowsPath(routerAddress);
+  const existing = await readJson<ProtocolRowsEntry>(path);
+  const merged = mergeByTxHash(existing?.rows ?? [], rows);
+  const entry: ProtocolRowsEntry = {
+    routerAddress: routerAddress.toLowerCase(),
+    windowDays: existing?.windowDays ?? 0,
+    rows: merged,
+    fetchedAt: new Date().toISOString(),
+  };
+  await writeJson(path, entry);
+  console.log(
+    `[cache] Dune protocol: appended ${rows.length} row(s); total=${merged.length}`
+  );
+}
+
+export async function markDuneProtocolFetchComplete(
+  routerAddress: string,
+  windowDays: number,
+  rowCount: number
+): Promise<void> {
+  const entry: ProtocolMarkerEntry = {
+    routerAddress: routerAddress.toLowerCase(),
+    windowDays,
+    rowCount,
+    fetchedAt: new Date().toISOString(),
+  };
+  await writeJson(protocolMarkerPath(routerAddress), entry);
+  const rowsPath = protocolRowsPath(routerAddress);
+  const existing = await readJson<ProtocolRowsEntry>(rowsPath);
+  if (existing) {
+    existing.windowDays = Math.max(existing.windowDays, windowDays);
+    existing.fetchedAt = entry.fetchedAt;
+    await writeJson(rowsPath, existing);
+  }
+  console.log(
+    `[cache] Dune protocol marker: router=${routerAddress.slice(0, 10)}... rows=${rowCount} window=${windowDays}d`
+  );
+}
+
+function mergeByTxHash(
+  existing: ProtocolTxRow[],
+  incoming: ProtocolTxRow[]
+): ProtocolTxRow[] {
+  const map = new Map<string, ProtocolTxRow>();
+  for (const r of existing) map.set(r.txHash, r);
+  for (const r of incoming) map.set(r.txHash, r);
+  return Array.from(map.values()).sort(
+    (a, b) =>
+      new Date(b.inclusionBlockTime).getTime() -
+      new Date(a.inclusionBlockTime).getTime()
+  );
 }

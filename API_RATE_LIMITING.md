@@ -1,162 +1,167 @@
-# API Rate Limiting Guide
+# API Rate Limiting — Authoritative Reference
 
-This project uses a **generic rate limiter** to manage API requests across all free-tier APIs. This ensures we stay within rate limits and avoid getting blocked or throttled.
+This is the single source of truth for external-API rate limits in this project.
+**Dev MUST consult this file before** adding a new API call, bumping a rate limit,
+or changing concurrency.
 
-## Overview
+Last audited: **2026-04-13** — see "Audit Log" at the bottom.
 
-The rate limiter is implemented in [`lib/rate-limiter.ts`](lib/rate-limiter.ts) and provides:
+---
 
-- **Per-second request throttling** — ensures we don't exceed X requests per second
-- **Concurrent request limits** — limits the number of simultaneous requests
-- **Automatic queuing** — requests are queued if limits are reached
-- **Transparent API** — simple `execute()` method that handles everything
+## Cardinal Rule
 
-## Current API Integrations
+> **Every external API call MUST go through `rateLimiters.<service>.execute(fn)`
+> from `lib/rate-limiter.ts`. No exceptions.**
 
-### CoinGecko (Token Prices)
-- **Limit**: 10 requests/second (free tier ~50 req/min)
-- **Used in**: [`lib/analysis/calculator.ts`](lib/analysis/calculator.ts)
-- **Concurrent**: 3 requests max
-- **Implementation**: Wraps `getTokenPrice()` calls
+If a new service is added, its limiter must be defined in `rate-limiter.ts` *before*
+the first call site lands. A direct `axios` / `fetch` call that bypasses the limiter
+is a bug, regardless of how low the call volume looks.
 
-```typescript
-return await rateLimiters.coingecko.execute(async () => {
-  // Your API call here
-});
-```
+---
 
-### Etherscan (Transaction History)
-- **Limit**: 5 requests/second (free tier limit)
-- **Used in**: [`lib/data-sources/etherscan.ts`](lib/data-sources/etherscan.ts)
-- **Concurrent**: 1 request max (conservative for stability)
-- **Implementation**: Wraps each paginated request
+## Services In Use
 
-### Tenderly (Transaction Simulation)
-- **Limit**: 50 requests/second (free tier is generous)
-- **Used in**: [`lib/data-sources/tenderly.ts`](lib/data-sources/tenderly.ts)
-- **Concurrent**: 5 requests max
-- **Implementation**: Wraps each simulation request
+The table below lists the **official vendor limit**, the **configured limit in code**,
+and the **call sites** that must stay wrapped. When vendor docs change, update both
+`lib/rate-limiter.ts` and this file in the same commit.
 
-## How to Use
+| Service     | Vendor limit (free tier)            | Configured (`rate-limiter.ts`) | Concurrency | Auth              | Notes |
+|-------------|-------------------------------------|--------------------------------|-------------|-------------------|-------|
+| Etherscan   | 3 req/sec (free); 5/sec is paid Lite | 3 req/sec                      | 1           | `ETHERSCAN_API_KEY` | Paginate at 10k results; `page * offset <= 10000` |
+| Tenderly    | ~400 sims/min (≈6.7/sec), 120k/mo    | 6 req/sec                      | 3           | `TENDERLY_API_KEY`  | Hex values, 8M gas, `save:false`, `simulation_type:"full"` (HR-1,2) |
+| DeFiLlama   | No hard rate limit published         | 5 req/sec (conservative)       | 2           | None              | Batch tokens, **chunk at 80** per request (HR-7) |
+| Dune        | 2,500 credits/month (credit-based)   | **NOT WRAPPED — see violation below** | — | `DUNE_API_KEY`    | Use `performance: "medium"`; polling loop fires up to 60 GETs/query |
 
-### For Existing APIs
-Just use the pre-configured rate limiters:
+> CoinGecko is **NOT** used. HR-7 forbids it — all pricing goes through DeFiLlama.
+> Any reference to CoinGecko in new code is a review-blocker.
 
-```typescript
-import { rateLimiters } from "@/lib/rate-limiter";
+### Hard-coded timeouts (`lib/constants.ts` → `API_RATE_LIMITS`)
 
-// CoinGecko
-await rateLimiters.coingecko.execute(async () => {
-  return await fetch("https://api.coingecko.com/...");
-});
+| Constant                          | Value    | Applies to                          |
+|-----------------------------------|----------|-------------------------------------|
+| `DEFILLAMA_REQ_PER_SEC`           | 5        | Mirror of limiter cfg               |
+| `ETHERSCAN_REQ_PER_SEC`           | 3        | Mirror of limiter cfg               |
+| `DUNE_QUERY_TIMEOUT_MS`           | 30_000   | `axios` timeout per Dune call       |
+| `TENDERLY_SIMULATION_TIMEOUT_MS`  | 30_000   | `axios` timeout per simulation      |
 
-// Etherscan
-await rateLimiters.etherscan.execute(async () => {
-  return await axios.get("https://api.etherscan.io/...");
-});
+If you change a value in `rate-limiter.ts`, update the mirror constant in
+`constants.ts` *and* the table above in the same commit.
 
-// Tenderly
-await rateLimiters.tenderly.execute(async () => {
-  return await axios.post("https://api.tenderly.co/...");
-});
-```
+---
 
-### For New APIs
-1. Add a new rate limiter instance in [`lib/rate-limiter.ts`](lib/rate-limiter.ts):
+## Current Call-Site Inventory
 
-```typescript
-export const rateLimiters = {
-  // ... existing limiters
-  newapi: new RateLimiter({
-    requestsPerSecond: 10,  // Adjust based on API limits
-    maxConcurrent: 2,       // Adjust based on API requirements
-  }),
-};
-```
+Every external call is listed here. If you add a new call site, append it to this
+list in the same PR.
 
-2. Use it in your API code:
+### Etherscan — all wrapped ✅
+- `lib/data-sources/etherscan.ts:14` — `getLatestBlockNumber` (`eth_blockNumber`)
+- `lib/data-sources/etherscan.ts:87` — `fetchWalletTransactions` (`account.txlist`, paginated)
+- `lib/data-sources/etherscan.ts:185` — `fetchWalletERC20Transfers` (`account.tokentx`)
+- `lib/data-sources/etherscan.ts:249` — `getTransactionReceipt` (`proxy.eth_getTransactionReceipt`)
+- `lib/data-sources/etherscan.ts:280` — `getCode` (`proxy.eth_getCode`) — called in a per-address loop in `batchCheckContracts`; relies on the limiter to pace the loop
 
-```typescript
-import { rateLimiters } from "@/lib/rate-limiter";
+### Tenderly — all wrapped ✅
+- `lib/data-sources/tenderly.ts:57` — `simulateTransaction` (`POST /simulate`)
 
-await rateLimiters.newapi.execute(async () => {
-  return await fetch("https://api.newapi.com/...");
-});
-```
+### DeFiLlama — all wrapped ✅
+- `lib/analysis/calculator.ts:37` — `batchGetTokenPrices` (`GET /prices/current/...`), chunked at 80
 
-## Configuration Reference
+### Dune — NOT wrapped ❌ (see violation)
+- `lib/data-sources/dune.ts:52` — `POST /sql/execute`
+- `lib/data-sources/dune.ts:83` — `GET /execution/{id}/results` (inside a 60-iteration poll loop, 2s cadence)
 
-### Rate Limit Defaults
-- **CoinGecko**: 10 req/sec, 3 concurrent (conservative estimate from 50/min)
-- **Etherscan**: 5 req/sec, 1 concurrent (strict to ensure reliability)
-- **Tenderly**: 50 req/sec, 5 concurrent (generous free tier)
+---
 
-To adjust limits, edit [`lib/constants.ts`](lib/constants.ts):
+## Known Violations (as of 2026-04-13)
 
-```typescript
-export const API_RATE_LIMITS = {
-  COINGECKO_REQ_PER_SEC: 10,
-  ETHERSCAN_REQ_PER_SEC: 5,
-  // ... add more as needed
-} as const;
-```
+### V1 — Dune bypasses the rate limiter (blocker)
 
-## Monitoring
+**Where:** `lib/data-sources/dune.ts` lines 52 and 83.
 
-To check rate limiter stats (for debugging):
+**What:** Both `axios` calls go out with no limiter wrapping. There is also no
+`rateLimiters.dune` defined in `lib/rate-limiter.ts`.
 
-```typescript
-const stats = rateLimiters.coingecko.getStats();
-console.log(stats);
-// Output:
-// {
-//   activeRequests: 2,
-//   recentRequests: 8,      // In the last second
-//   queuedRequests: 0,
-// }
-```
+**Why it matters:**
+- Violates the Cardinal Rule above.
+- Dune's credit budget (2,500/mo) is the tightest of any service in this project;
+  every run burns credits, and concurrent runs can race.
+- The polling loop can fire up to 60 GETs for a single `queryMempoolData` call. If
+  two wallet analyses overlap, request bursts interleave with zero pacing.
+- When Dune eventually returns 429s or rate errors, there's no back-pressure; the
+  pipeline will just fail loudly instead of queueing.
 
-## How It Works Internally
+**Fix plan (for dev):**
+1. Add to `lib/rate-limiter.ts`:
+   ```ts
+   dune: new RateLimiter({
+     requestsPerSecond: 2,  // conservative; Dune free tier has no documented per-sec limit
+     maxConcurrent: 1,      // only one Dune query in flight at a time
+   }),
+   ```
+2. Wrap both `axios.post` and `axios.get` in `dune.ts` with
+   `await rateLimiters.dune.execute(async () => { ... })`.
+3. Leave `retryWithBackoff` around the `execute` call, not inside it (same pattern
+   as `tenderly.ts:55-87`).
+4. Update the table above to reflect the new configured values.
+5. Update `blueprints/03-api-contracts/dune.md` if that file exists.
 
-1. **Request arrives** → Rate limiter checks if we're within limits
-2. **Within limits** → Request executes immediately
-3. **At limit** → Request waits until a slot opens up
-4. **Concurrent limit hit** → Request queued and waits for active request to complete
-5. **Timestamps tracked** → Sliding window of last 1-second requests
-6. **Auto cleanup** → Old timestamps dropped after 1 second
+---
 
-## Best Practices
+## Checklist — Before Merging Any API-Touching Change
 
-✅ **DO**:
-- Wrap all external API calls in `rateLimiters.apiname.execute()`
-- Keep concurrent limits conservative (start with 1-5)
-- Monitor stats during development to ensure limits are appropriate
+Dev MUST tick every box. Review blocks on any ❌.
 
-❌ **DON'T**:
-- Call APIs directly without rate limiting (you'll risk getting blocked)
-- Set `requestsPerSecond` higher than the API allows
-- Use very high `maxConcurrent` values (risk overwhelming the API)
+- [ ] Every new external call goes through `rateLimiters.<service>.execute(fn)`.
+- [ ] If a new service is introduced, a limiter entry is added to `rate-limiter.ts`
+      with **both** `requestsPerSecond` and `maxConcurrent` set, and the values
+      have a comment citing the vendor's documented limit.
+- [ ] `lib/constants.ts` mirror constants are updated if the limiter values changed.
+- [ ] The "Services In Use" table and "Current Call-Site Inventory" in **this file**
+      are updated in the same commit.
+- [ ] The cache layer (see `blueprints/05-database-schema.md`) is checked *before*
+      hitting the API — rate limits don't matter if cache hits avoid the call entirely.
+- [ ] For bursty endpoints (Dune polling, Etherscan pagination, Tenderly per-tx
+      simulation in pipelines), confirm the limiter's `requestsPerSecond` × typical
+      burst fits within the vendor's per-minute budget too.
+- [ ] No CoinGecko. HR-7.
+- [ ] Tenderly values are hex (HR-1), gas is `SIMULATION_GAS_LIMIT = 8_000_000` (HR-2).
+- [ ] DeFiLlama token batches chunked at ≤80 (HR-7).
 
-## Troubleshooting
+---
 
-### "Hitting rate limits and getting 429 errors"
-- Lower `requestsPerSecond` or `maxConcurrent`
-- Check if you're making more requests than expected
-- Consider batching requests where possible
+## How the Limiter Works (short version)
 
-### "API is slow / responses are delayed"
-- This is expected when at rate limits (throttling is working!)
-- If too slow, check if the rate limits are too conservative
-- Verify the API's actual free tier limits
+`lib/rate-limiter.ts` maintains a sliding 1-second window of request timestamps per
+service. `execute(fn)`:
 
-### "Rate limiter not working"
-- Ensure you're using `await rateLimiters.apiname.execute()`
-- Check that the rate limiter is imported correctly
-- Look for errors in console logs
+1. Waits until `activeRequests < maxConcurrent`.
+2. Waits until the 1-second window has fewer than `requestsPerSecond` entries
+   (sleeps until the oldest entry expires + 1ms buffer).
+3. Pushes a timestamp, increments `activeRequests`, runs `fn`.
+4. On finish/throw, decrements `activeRequests` and drains the queue.
+
+There is no cross-process coordination — the limiter is in-memory per Node process.
+If the pipeline ever moves to multi-worker, the limiter must be reworked (Redis-backed
+token bucket or similar). Until then, `maxConcurrent: 1` on the tightest service
+(Etherscan, Dune) is what keeps bursts in check.
+
+---
+
+## Audit Log
+
+| Date       | Auditor | Scope                                      | Result |
+|------------|---------|--------------------------------------------|--------|
+| 2026-04-13 | Claude  | Grep every `fetch`/`axios` call in `lib/`; match against `rateLimiters.*.execute` wrapping | ✅ Etherscan, Tenderly, DeFiLlama clean. ❌ Dune bypasses limiter — V1 filed above. Stale file rewritten (old file referenced CoinGecko & wrong limits). |
+
+When you run a new audit, append a row — do not overwrite. Keep rows short; link
+to a PR or report for detail.
+
+---
 
 ## See Also
-- [`lib/rate-limiter.ts`](lib/rate-limiter.ts) — Rate limiter implementation
-- [`lib/constants.ts`](lib/constants.ts) — API rate limit constants
-- [`lib/analysis/calculator.ts`](lib/analysis/calculator.ts) — CoinGecko example
-- [`lib/data-sources/etherscan.ts`](lib/data-sources/etherscan.ts) — Etherscan example
-- [`lib/data-sources/tenderly.ts`](lib/data-sources/tenderly.ts) — Tenderly example
+- `lib/rate-limiter.ts` — implementation
+- `lib/constants.ts` — `API_RATE_LIMITS` mirrors
+- `CLAUDE.md` → "External API Discipline" & "Hardened Rules" sections
+- `blueprints/03-api-contracts/` — per-service request/response shapes
+- `blueprints/05-database-schema.md` — cache TTLs (call the cache before the API)

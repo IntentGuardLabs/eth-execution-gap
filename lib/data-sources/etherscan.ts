@@ -49,8 +49,9 @@ interface EtherscanTx {
  * Fetch transaction history for a wallet from Etherscan
  */
 export async function fetchWalletTransactions(
-  address: string
-): Promise<Transaction[]> {
+  address: string,
+  options?: { startBlockOverride?: number }
+): Promise<{ transactions: Transaction[]; latestBlock: number }> {
   const apiKey = process.env.ETHERSCAN_API_KEY;
 
   if (!apiKey) {
@@ -60,7 +61,6 @@ export async function fetchWalletTransactions(
   }
 
   // Etherscan enforces page * offset <= 10000, so we use pageSize=1000, max 10 pages.
-  // Limit to ANALYSIS_WINDOW_DAYS to keep analysis fast and API-friendly.
   const transactions: Transaction[] = [];
   let page = 1;
   const pageSize = 1000;
@@ -70,10 +70,15 @@ export async function fetchWalletTransactions(
   const latestBlock = await getLatestBlockNumber(apiKey);
   const blocksPerDay = Math.floor((24 * 60 * 60) / BLOCK_TIME_SECONDS); // 7200 blocks/day
   const windowBlocks = blocksPerDay * ANALYSIS_WINDOW_DAYS;
-  const startBlock = Math.max(0, latestBlock - windowBlocks);
+  const windowStartBlock = Math.max(0, latestBlock - windowBlocks);
 
-  const windowStartDate = new Date(Date.now() - ANALYSIS_WINDOW_DAYS * 24 * 60 * 60 * 1000);
-  console.log(`[etherscan] Fetching txs for ${address} — window: ${ANALYSIS_WINDOW_DAYS} days (since ${windowStartDate.toISOString().slice(0, 10)}), blocks ${startBlock}..${latestBlock} (~${windowBlocks} blocks), pageSize=${pageSize}, maxPages=${maxPages}`);
+  // Task 6: Use startBlockOverride for incremental fetching (lastFetchedBlock + 1)
+  const startBlock = options?.startBlockOverride
+    ? Math.max(windowStartBlock, options.startBlockOverride)
+    : windowStartBlock;
+
+  const isIncremental = !!options?.startBlockOverride;
+  console.log(`[etherscan] ${isIncremental ? "INCREMENTAL" : "FULL"} fetch for ${address} — blocks ${startBlock}..${latestBlock} (~${latestBlock - startBlock} blocks), pageSize=${pageSize}, maxPages=${maxPages}`);
 
   while (page <= maxPages) {
     try {
@@ -159,110 +164,6 @@ export async function fetchWalletTransactions(
   }
 
   console.log(`[etherscan] Done: ${transactions.length} total transactions fetched for ${address} across ${page} page(s)`);
-  return transactions;
+  return { transactions, latestBlock };
 }
 
-/**
- * Fetch ERC20 transfer events for a wallet
- */
-export async function fetchWalletERC20Transfers(
-  address: string
-): Promise<Transaction[]> {
-  const apiKey = process.env.ETHERSCAN_API_KEY;
-
-  if (!apiKey) {
-    throw new Error("ETHERSCAN_API_KEY not configured");
-  }
-
-  try {
-    const response = await retryWithBackoff(
-      async () => {
-        return await rateLimiters.etherscan.execute(async () => {
-          const { data } = await axios.get(ETHERSCAN_API_URL, {
-            params: {
-              chainid: CHAIN_ID,
-              module: "account",
-              action: "tokentx",
-              address,
-              startblock: 0,
-              endblock: 99999999,
-              sort: "asc",
-              apikey: apiKey,
-            },
-            timeout: 10000,
-          });
-
-          if (data.status === "0") {
-            if (data.message === "No transactions found") {
-              return [];
-            }
-            throw new Error(`Etherscan API error: ${data.message}`);
-          }
-
-          return data.result || [];
-        });
-      },
-      3,
-      1000
-    );
-
-    return response.map((tx: EtherscanTx) => ({
-      hash: tx.hash,
-      from: tx.from,
-      to: tx.to,
-      value: tx.value,
-      input: tx.input,
-      gas: tx.gas,
-      gasPrice: tx.gasPrice,
-      gasUsed: tx.gasUsed,
-      blockNumber: parseInt(tx.blockNumber),
-      blockHash: tx.blockHash,
-      transactionIndex: parseInt(tx.transactionIndex),
-      isError: tx.isError,
-      txreceipt_status: tx.txreceipt_status,
-      timeStamp: tx.timeStamp,
-    }));
-  } catch (error) {
-    console.error(`Error fetching ERC20 transfers for ${address}:`, error);
-    return [];
-  }
-}
-
-/**
- * Get transaction receipt from Etherscan
- */
-export async function getTransactionReceipt(txHash: string) {
-  const apiKey = process.env.ETHERSCAN_API_KEY;
-
-  if (!apiKey) {
-    throw new Error("ETHERSCAN_API_KEY not configured");
-  }
-
-  try {
-    const response = await retryWithBackoff(
-      async () => {
-        return await rateLimiters.etherscan.execute(async () => {
-          const { data } = await axios.get(ETHERSCAN_API_URL, {
-            params: {
-              chainid: CHAIN_ID,
-              module: "proxy",
-              action: "eth_getTransactionReceipt",
-              txhash: txHash,
-              apikey: apiKey,
-            },
-            timeout: 10000,
-          });
-
-          return data.result;
-        });
-      },
-      3,
-      1000
-    );
-
-    return response;
-  } catch (error) {
-    console.error(`Error fetching receipt for ${txHash}:`, error);
-    return null;
-  }
-}

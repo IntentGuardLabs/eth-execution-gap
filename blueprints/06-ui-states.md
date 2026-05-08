@@ -52,9 +52,7 @@ What the user sees at each stage of interaction. If the code differs from this d
 #### State 1.2: Idle (Leaderboard Populated)
 
 - **Search form**: Input accepts `0x...` hex addresses. Placeholder mentions ENS but ENS resolution is not implemented.
-- **Leaderboard table**: Ranked entries with columns: Rank, Address (truncated), Total Loss (with CSS bar), Sandwiched count, Slippage, Last hit
-  - **Slippage column**: fabricated — `totalLossUsd * 0.28` (see Shared UI Patterns below)
-  - **Last hit column**: fabricated — shows `"{i+2}h ago"` for top 3, `"{i+1}d ago"` for rest. Based on row index, not API data.
+- **Leaderboard table**: Ranked entries with columns: Rank, Address (truncated), Total Loss (with CSS bar), Sandwiched count
 - **Sortable columns**: "Total Loss" and "Sandwiches" headers toggle client-side sort (no re-fetch)
 - **Time period buttons**: 24h / 7d / 30d / All time — **decorative only**, no click handlers. "All time" styled as active.
 
@@ -161,8 +159,8 @@ Four hardcoded cards — not fetched from any API:
 **Section 2 — Summary Cards (4-up grid)**:
 | Card | Value | Style |
 |------|-------|-------|
-| Total Loss (30d) | `totalLossUsd` | Red border, gradient text |
-| Annualized Loss | `totalLossUsd * 365/30` | — |
+| Total Loss (10d) | `totalLossUsd` | Red border, gradient text |
+| Annualized Loss | `totalLossUsd * 365/10` | — |
 | Transactions Analyzed | `txsAnalyzed` | — |
 | Sandwiched Transactions | `txsSandwiched` | Orange accent |
 
@@ -288,10 +286,6 @@ Both landing page and wall-of-shame use the same visual pattern:
 - Width: `(entry.totalLossUsd / maxLoss) * 100%`
 - Background: red-orange gradient
 
-### Slippage Column (Fabricated)
-
-Both leaderboard views show a "Slippage" column computed as `totalLossUsd * 0.28`. The leaderboard API does not return a slippage breakdown — this is a **hardcoded placeholder multiplier**.
-
 ### Address Truncation
 
 | Context | Format | Example |
@@ -318,7 +312,7 @@ GET /api/results/{address}
     ↓
 WalletAnalysisResult
     ├── totalLossUsd      → Summary card #1
-    ├── annualizedLossUsd  → Summary card #2 (computed: totalLossUsd * 365/30)
+    ├── annualizedLossUsd  → Summary card #2 (computed: totalLossUsd * 365/10)
     ├── txsAnalyzed        → Summary card #3
     ├── txsSandwiched      → Summary card #4
     ├── sandwichLossUsd    → Category card #1
@@ -352,11 +346,10 @@ LeaderboardResponse
 
 ## Known Issues
 
-| Issue | Location | Impact | Severity |
-|-------|----------|--------|----------|
-| Slippage column is fabricated (0.28 multiplier) | Both leaderboards | Misleading data | **Medium** — user sees inaccurate breakdown |
-| "Last hit" column is fabricated (row-index-based) | Landing page leaderboard | Misleading data — shows fake recency | **Medium** — user sees fake timestamps |
-| Time period buttons are decorative | Both leaderboards | Feature appears interactive but does nothing | **Low** — cosmetic |
-| ENS input placeholder but no resolution | Landing page | User expects ENS to work | **Low** — misleading placeholder |
-| Transactions capped at 15 with no "show more" | Results page | Users with many txs can't see full list | **Low** — data truncation |
-| Stats section is hardcoded | Landing page | Numbers are static placeholders | **Low** — cosmetic |
+_No known issues remaining. All cosmetic items resolved._
+
+**Resolved:**
+- Time period buttons replaced with static "All time" label (both leaderboards)
+- ENS placeholder removed from search input
+- Stats section removed (was fabricated data)
+- Transaction table cap removed (shows all rows)

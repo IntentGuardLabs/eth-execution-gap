@@ -162,8 +162,10 @@ This is conservative — assumes the tx was available one block before inclusion
 | Query partial | `state === "QUERY_STATE_COMPLETED_PARTIAL"` | Extract available rows, log warning |
 | Polling timeout (120s) | `attempts >= maxAttempts` | Throw — pipeline catches and continues |
 | Tx not in mempool dumpster | Hash not in results | Use `estimateMempoolBlockNumber()` fallback |
-| API key invalid | HTTP 401/403 | Throw — cannot proceed |
-| Rate limit exceeded | HTTP 429 | Retry with backoff (2 retries, 2s initial) |
+| API key invalid | HTTP 401/403 | Throw — pipeline catches and continues with fallback |
+| Rate limit exceeded | HTTP 429 | Retry with backoff (2 total attempts, 2s initial) |
+
+**Two-layer fallback strategy**: The pipeline wraps `queryMempoolData()` in a try/catch (`pipeline.ts`). If Dune fails entirely (any throw), the pipeline continues with an empty map. Then per-tx, missing map entries fall back to `estimateMempoolBlockNumber(inclusionBlock)` = block N-1. This means Dune being completely down is non-fatal — the analysis completes with estimated mempool blocks for all txs.
 
 ## Credit Conservation
 

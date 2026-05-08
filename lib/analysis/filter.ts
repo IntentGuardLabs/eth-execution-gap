@@ -1,4 +1,5 @@
 import type { Transaction } from "@/lib/types";
+import { DEX_METHOD_SIGS } from "@/lib/constants";
 
 /**
  * METHOD SIGNATURE BLACKLIST
@@ -19,16 +20,26 @@ const EXCLUDED_METHOD_SIGS = new Set([
   "0xf242432a", // safeTransferFrom(address,address,uint256,uint256,bytes)
   "0x2eb2c2d6", // safeBatchTransferFrom(address,address,uint256[],uint256[],bytes)
 
-  // --- WETH ---
+  // --- WETH (Task 13) ---
   "0x2e1a7d4d", // withdraw(uint256) — unwrap
   "0xd0e30db0", // deposit() — wrap
 
-  // --- Governance / Admin ---
+  // --- Governance (Task 11) ---
   "0x3659cfe6", // upgradeTo(address) — proxy upgrade
   "0x5c19a95c", // delegate(address) — governance delegation
   "0x56781388", // castVote(uint256,uint8)
+  "0x7b3c71d3", // castVoteWithReason(uint256,uint8,string)
+  "0x3bccf4fd", // castVoteBySig(uint256,uint8,uint8,bytes32,bytes32)
+  "0x7d5e81e2", // propose(address[],uint256[],bytes[],string) — OpenZeppelin Governor
+  "0xda95691a", // propose(address[],uint256[],string[],bytes[],string) — Compound Governor
   "0xb61d27f6", // execute(address,uint256,bytes) — multisig execute
-  "0x6a761202", // execTransaction(...) — Gnosis Safe execute
+
+  // --- Staking (Task 12) ---
+  "0x049878f3", // join(uint256) — staking pool join
+  "0x2e17de78", // unstake(uint256) — generic unstake
+  "0xa694fc3a", // stake(uint256) — common staking selector
+
+  // 0x6a761202 (Safe execTransaction) is NOT blacklisted — decoded via decodeSafeInnerCall()
 ]);
 
 /**
@@ -46,7 +57,10 @@ const EXCLUDED_CONTRACTS = new Set([
   "0xbbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb", // Morpho Blue
   "0x89b78cfa322f6c5de0abceecab66aee45393cc5a", // Maker DSR Manager
 
-  // --- Liquid Staking ---
+  // --- WETH (Task 13) ---
+  "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2", // WETH — wrap/unwrap only, no execution gap
+
+  // --- Liquid Staking / Staking (Task 12) ---
   "0xae7ab96520de3a18e5e111b5eaab095312d7fe84", // Lido stETH
   "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0", // Lido wstETH
   "0xae78736cd615f374d3085123a210448e74fc6393", // Rocket Pool rETH
@@ -56,6 +70,8 @@ const EXCLUDED_CONTRACTS = new Set([
   "0xd5f7838f5c461feff7fe49ea5ebaf7728bb0adfa", // Mantle mETH
   "0x858646372cc42e1a627fce94aa7a7033e7cf075a", // EigenLayer Strategy Manager
   "0x39053d51b77dc0d36036fc1fcc8cb819df8ef37a", // EigenLayer Delegation Manager
+  "0x00000000219ab540356cbb839cbe05303d7705fa", // ETH2 Deposit Contract (staking)
+  "0xd9a442856c234a39a81a089c06451ebaa4306a72", // pufETH (Puffer Finance)
 
   // --- Bridges ---
   "0x72ce9c846789fdb6fc1f34ac4ad25dd9ef7031ef", // Arbitrum Gateway Router
@@ -66,6 +82,12 @@ const EXCLUDED_CONTRACTS = new Set([
   "0x8731d54e9d02c286767d56ac03e8037c07e01e98", // Stargate Router
   "0x5c7bcd6e7de5005b46012c0f2ee135ab3b3f3b0a", // Across SpokePool
   "0xb8901acb165ed027e32754e0ffe830802919727f", // Hop Protocol L1 Bridge (ETH)
+
+  // --- Governance (Task 11) ---
+  "0x323a76c9b45b22c891c760d8b3b6a82a7386e775", // Compound Governor Bravo
+  "0x408ed6354d4973f66138c91495f2f2fcbd8724c3", // Uniswap Governor
+  "0xb3a87172f555ae2a2ab79be60b336d2f7d0187f0", // ENS Governor
+  "0x6e9fda02b159a32e5095b8b54e50f01bc5c0cfb0", // Aave Governance V3
 
   // --- ENS ---
   "0x253553366da8546fc250f225fe3d25d0c782303b", // ENS Registrar Controller
@@ -81,17 +103,73 @@ const EXCLUDED_CONTRACTS = new Set([
 ]);
 
 /**
+ * Task 16: Known DEX swap selectors — if calldata matches one of these,
+ * the tx is likely a DEX interaction even if `to` appears to be an EOA.
+ * This handles EIP-7702 delegated execution where an EOA delegates to a DEX contract.
+ */
+const KNOWN_DEX_SELECTORS: Set<string> = new Set(
+  Object.values(DEX_METHOD_SIGS)
+    .filter((sig) => sig !== DEX_METHOD_SIGS.TRANSFER && sig !== DEX_METHOD_SIGS.APPROVE)
+);
+
+// Safe execTransaction selector
+const SAFE_EXEC_SELECTOR = "0x6a761202";
+
+/**
+ * Decode the inner call from a Gnosis Safe execTransaction calldata.
+ *
+ * ABI layout (known, hardcoded — no API call needed):
+ *   execTransaction(address to, uint256 value, bytes data, uint8 operation, ...)
+ *
+ * Extracts `to` (the inner target) and the first 4 bytes of `data` (inner selector).
+ * Returns null if calldata is malformed or too short.
+ */
+function decodeSafeInnerCall(
+  input: string
+): { to: string; innerSelector: string; hasData: boolean } | null {
+  // Minimum length: "0x" + 8 (selector) + 10*64 (10 params × 32 bytes) = 650 hex chars
+  if (input.length < 650) return null;
+
+  const params = input.slice(10); // strip "0x" + 4-byte selector
+
+  // Slot 0 (chars 0–63): `address to` — address is last 40 hex chars
+  const to = "0x" + params.slice(24, 64);
+
+  // Slot 2 (chars 128–191): byte offset to `bytes data` (from start of params)
+  const dataByteOffset = parseInt(params.slice(128, 192), 16);
+  const dataHexOffset = dataByteOffset * 2;
+
+  // At that offset: 32-byte length word, then the actual bytes
+  if (params.length < dataHexOffset + 64) return null;
+  const dataLength = parseInt(params.slice(dataHexOffset, dataHexOffset + 64), 16);
+
+  if (dataLength === 0) {
+    // No inner calldata — pure ETH transfer from Safe
+    return { to, innerSelector: "", hasData: false };
+  }
+
+  const innerDataStart = dataHexOffset + 64;
+  if (params.length < innerDataStart + 8) return null;
+
+  const innerSelector = "0x" + params.slice(innerDataStart, innerDataStart + 8).toLowerCase();
+  return { to, innerSelector, hasData: true };
+}
+
+/**
  * Determine if a transaction needs simulation to detect execution gaps.
  *
  * Uses a BLACKLIST approach: we exclude transactions where there is
  * fundamentally no expected-vs-actual output to compare (transfers,
  * approvals, staking, lending, bridging, governance, etc.).
  *
+ * For Safe wallets (selector 0x6a761202): decodes the inner call and
+ * applies the same blacklist to the inner selector and target contract.
+ *
  * Everything NOT excluded goes to Tenderly for simulation.
  * This is intentionally over-inclusive — if in doubt we simulate
  * and let a zero-delta result prove there was no gap.
  */
-export function needsSimulation(tx: Transaction): boolean {
+export function needsSimulation(tx: Transaction, knownContracts?: Set<string>): boolean {
   // Failed txs have no meaningful output to compare
   if (tx.isError === "1" || tx.txreceipt_status === "0") {
     return false;
@@ -107,8 +185,31 @@ export function needsSimulation(tx: Transaction): boolean {
     return false;
   }
 
-  // Known no-gap method signatures (transfers, approvals, wraps, governance, etc.)
   const methodSig = tx.input.slice(0, 10).toLowerCase();
+
+  // Task 14: Skip EOA recipients — if we know the address is not a contract,
+  // there's no DEX interaction to simulate (even if calldata is present).
+  // Task 16: BUT if the calldata matches a known DEX selector, simulate anyway —
+  // this handles EIP-7702 delegated execution where an EOA delegates to a DEX.
+  if (knownContracts && !knownContracts.has(tx.to.toLowerCase())) {
+    if (KNOWN_DEX_SELECTORS.has(methodSig)) {
+      // Likely EIP-7702 delegate or misclassified contract — simulate to be safe
+    } else {
+      return false;
+    }
+  }
+
+  // Safe execTransaction — decode inner call and filter on that
+  if (methodSig === SAFE_EXEC_SELECTOR) {
+    const inner = decodeSafeInnerCall(tx.input);
+    if (!inner) return true; // malformed — simulate to be safe
+    if (!inner.hasData) return false; // pure ETH transfer via Safe
+    if (EXCLUDED_METHOD_SIGS.has(inner.innerSelector)) return false;
+    if (EXCLUDED_CONTRACTS.has(inner.to.toLowerCase())) return false;
+    return true; // inner call is not blacklisted — simulate
+  }
+
+  // Known no-gap method signatures (transfers, approvals, wraps, governance, etc.)
   if (EXCLUDED_METHOD_SIGS.has(methodSig)) {
     return false;
   }
@@ -122,18 +223,16 @@ export function needsSimulation(tx: Transaction): boolean {
   return true;
 }
 
-/** @deprecated Use needsSimulation instead */
-export const shouldAnalyze = needsSimulation;
-
 /**
  * Filter out transactions that don't need simulation.
  * Returns only txs where expected-vs-actual output comparison is meaningful.
  */
 export function filterTransactionsForSimulation(
-  transactions: Transaction[]
+  transactions: Transaction[],
+  knownContracts?: Set<string>
 ): Transaction[] {
   const before = transactions.length;
-  const result = transactions.filter(needsSimulation);
+  const result = transactions.filter((tx) => needsSimulation(tx, knownContracts));
 
   const excluded = before - result.length;
   const failed = transactions.filter((tx) => tx.isError === "1" || tx.txreceipt_status === "0").length;
@@ -146,46 +245,4 @@ export function filterTransactionsForSimulation(
   );
 
   return result;
-}
-
-/** @deprecated Use filterTransactionsForSimulation instead */
-export const filterTransactionsForAnalysis = filterTransactionsForSimulation;
-
-/**
- * Get protocol label for a contract address (for UI display)
- */
-export function getProtocolLabel(contractAddress: string): string {
-  const addr = contractAddress.toLowerCase();
-
-  // Lending protocols
-  if (addr === "0x7d2768de32b0b80b7a3454c06bdac94a69ddc7a9")
-    return "Aave V2";
-  if (addr === "0x87870bca3f3fd6335c3f4ce8392d69350b4fa4e2")
-    return "Aave V3";
-  if (addr === "0x3d9819210a31b4961b30ef54be2aed79b9c9cd3b")
-    return "Compound V2";
-  if (addr === "0xc3d688b66703497daa19211eedff47f25384cdc3")
-    return "Compound V3";
-  if (addr === "0xbbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb")
-    return "Morpho Blue";
-
-  // DEX protocols
-  if (addr === "0x7a250d5630b4cf539739df2c5dacb4c659f2488d")
-    return "Uniswap V2";
-  if (addr === "0xe592427a0aece92de3edee1f18e0157c05861564")
-    return "Uniswap V3";
-  if (addr === "0x3fc91a3afd70395cd496c647d5a6cc9d4b2b7fad")
-    return "Uniswap Universal Router";
-  if (addr === "0x1111111254eeb25477b68fb85ed929f73a960582")
-    return "1inch";
-  if (addr === "0xd9e1ce17f2641f24ae83637ab66a2cca9c378b9f")
-    return "SushiSwap";
-
-  // Staking
-  if (addr === "0xae7ab96520de3a18e5e111b5eaab095312d7fe84")
-    return "Lido stETH";
-  if (addr === "0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0")
-    return "Lido wstETH";
-
-  return "Unknown Protocol";
 }

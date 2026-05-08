@@ -203,15 +203,38 @@ computeNetTokenFlows() → getTokenOutputFromChanges() → pipeline result.token
 
 Without this, 6-decimal tokens (USDC, USDT) have their gaps divided by `10^18` instead of `10^6` — making losses appear ~10^12x smaller than reality. WBTC (8 decimals) is similarly affected. Fall back to `18` only when `tokenDecimals` is missing.
 
-### HR-9: Net flow extraction must include native ETH
+### HR-9: Net flow extraction must match the real Tenderly `asset_changes` shape
 
-`computeNetTokenFlows()` in `tenderly.ts` MUST process native ETH transfers in addition to ERC-20 transfers. Tenderly's `asset_changes` includes native value movements as entries without `token_info`. These MUST be tracked using:
+`computeNetTokenFlows()` in `tenderly.ts` MUST read the **actual** field layout that Tenderly returns from the v1 `simulate` endpoint with `simulation_type: "full"`. Pre-2026-04-15 the codebase used an imagined shape (`token_info.address`, top-level `type === "ERC20"`) that does not exist in any Tenderly response. The real shape is:
 
-- Address: `0x0000000000000000000000000000000000000000` (zero address)
-- Symbol: `"ETH"`
-- Decimals: `18`
+```typescript
+{
+  type: "Mint" | "Transfer" | "Burn";     // event-level classification, NOT a token standard
+  from?: string;                          // absent on Mint
+  to: string;                              // always present
+  amount: string;                          // human-readable decimal ("0.1376") — NOT BigInt-parseable
+  raw_amount?: string;                     // wei string ("137600000000000000") — USE THIS for BigInt math
+  token_info: {
+    standard: "ERC20" | "NativeCurrency" | "ERC721" | "ERC1155";
+    type: "Fungible" | "Native" | "NonFungible";
+    contract_address?: string;             // absent for NativeCurrency
+    symbol?: string;
+    decimals?: number;
+  };
+}
+```
 
-Without this, any swap that outputs native ETH (e.g. USDC → ETH on Uniswap) produces no positive net flow, `getTokenOutputFromChanges()` returns `null`, and the transaction is silently dropped — hiding losses on the most common swap path.
+**Discrimination rules** — exactly what `computeNetTokenFlows()` does:
+
+1. **Native ETH**: `token_info.standard === "NativeCurrency"`. Tracked under the zero-address pseudo-token (`0x0000...0000`), symbol `"ETH"`, decimals `18`.
+2. **ERC-20**: `token_info.standard === "ERC20"` AND `token_info.contract_address` is present. Token address comes from `token_info.contract_address` (lowercased), NOT `token_info.address`.
+3. **Everything else** (non-fungibles, unclassified, ERC-20 missing a contract address): **logged and dropped**. Never collapsed into any other bucket.
+
+**BigInt amounts** come from `raw_amount`, with a fallback to the integer-truncated `amount` only for defensive handling. `amount` is a decimal string — passing it directly to `BigInt()` throws. The old code silently produced zero on every decimal amount by splitting on `"."` and taking `"0"`.
+
+**Pre-2026-04-15 consequence** (EC-P3.7): every ERC-20 asset change fell through the non-existent `token_info.address` check into the "no token_info → ETH" branch, got bucketed under the zero address, and had its amount parsed as `BigInt(0)`. Both the wallet pipeline and the protocol pipeline were silently producing zero raw amounts and zero USD gaps. The smoke test that showed this was the first real inspection of the output.
+
+**Top-level `change.type`** (`Mint` / `Transfer` / `Burn`) is NOT a token-standard discriminator. It describes the event, not the asset. Do not switch on it.
 
 ---
 
